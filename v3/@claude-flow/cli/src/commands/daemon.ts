@@ -254,7 +254,8 @@ async function startBackgroundDaemon(projectRoot: string, quiet: boolean, maxCpu
   const isWin = process.platform === 'win32';
   const spawnOpts: any = {
     cwd: resolvedRoot,
-    detached: !isWin,  // detached is POSIX-only; Windows uses windowsHide
+    // Use detached mode cross-platform so background child survives parent exit.
+    detached: true,
     stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
     env: {
       ...process.env,
@@ -262,7 +263,9 @@ async function startBackgroundDaemon(projectRoot: string, quiet: boolean, maxCpu
       // Prevent macOS SIGHUP kill when terminal closes
       ...(process.platform === 'darwin' ? { NOHUP: '1' } : {}),
     },
-    ...(isWin ? { shell: true, windowsHide: true } : {}),
+    // Avoid shell-mode spawn on Windows. Shell parsing can break quoted
+    // executable paths like "C:\Program Files\..." and cause stale PID files.
+    ...(isWin ? { windowsHide: true } : {}),
   };
 
   // Use spawn with explicit arguments instead of shell string interpolation
@@ -290,15 +293,13 @@ async function startBackgroundDaemon(projectRoot: string, quiet: boolean, maxCpu
     return { success: false, exitCode: 1 };
   }
 
-  // Unref BEFORE writing PID file — prevents race where parent exits
-  // but child hasn't fully detached yet (fixes macOS daemon death #1283)
+  // Unref immediately so parent can exit while child keeps running.
   child.unref();
 
-  // Small delay to let the child process fully detach on macOS
-  await new Promise(resolve => setTimeout(resolve, 100));
-
-  // Save PID only after child is detached
-  fs.writeFileSync(pidFile, String(pid));
+  // IMPORTANT: Do not write daemon.pid from the parent process.
+  // The foreground child writes and owns daemon.pid lifecycle.
+  // Parent-written pid can race child startup checks and cause false
+  // "daemon already running" short-circuit on Windows.
 
   if (!quiet) {
     output.printSuccess(`Daemon started in background (PID: ${pid})`);
