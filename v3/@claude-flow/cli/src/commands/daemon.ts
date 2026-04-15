@@ -261,7 +261,10 @@ async function startBackgroundDaemon(projectRoot: string, quiet: boolean, maxCpu
   const spawnOpts: Record<string, unknown> = {
     cwd: resolvedRoot,
     detached: !isWin,  // detached is POSIX-only; Windows uses windowsHide
-    stdio: ['ignore', fs.openSync(logFile, 'a'), fs.openSync(logFile, 'a')],
+    // Use 'ignore' for all stdio — passing fs.openSync() FDs causes the child to
+    // die on Windows when the parent exits and closes the FDs (#1478 Bug 3).
+    // The daemon writes its own logs via appendFileSync to .claude-flow/logs/.
+    stdio: ['ignore', 'ignore', 'ignore'],
     env: {
       ...process.env,
       CLAUDE_FLOW_DAEMON: '1',
@@ -301,11 +304,17 @@ async function startBackgroundDaemon(projectRoot: string, quiet: boolean, maxCpu
   // Unref immediately so parent can exit while child keeps running.
   child.unref();
 
-  // Small delay to let the child process fully detach on macOS
-  await new Promise(resolve => setTimeout(resolve, 100));
+  // Longer delay to let the child process start and write its own PID file.
+  // 100ms was too short on Windows; the child's checkExistingDaemon() would
+  // find the parent-written PID and return early (#1478 Bug 1).
+  await new Promise(resolve => setTimeout(resolve, 500));
 
-  // Save PID only after child is detached
-  fs.writeFileSync(pidFile, String(pid));
+  // Write PID file only if the child hasn't already written its own.
+  // The foreground child calls writePidFile() internally, but on some platforms
+  // it may not have started yet, so we write as a fallback.
+  if (!fs.existsSync(pidFile)) {
+    fs.writeFileSync(pidFile, String(pid));
+  }
 
   if (!quiet) {
     output.printSuccess(`Daemon started in background (PID: ${pid})`);
