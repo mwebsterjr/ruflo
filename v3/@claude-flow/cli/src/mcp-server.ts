@@ -27,6 +27,18 @@ import * as os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { trackRequest } from './mcp-tools/request-tracker.js';
+import {
+  isPolicyEnforcementEnabled,
+  loadMcpPolicy,
+  evaluateToolCall,
+} from './mcp-tools/policy-enforcer.js';
+
+/** A failed task can be valid data; only an explicit error denotes tool failure. */
+function hasToolError(result: unknown): boolean {
+  return result !== null && typeof result === 'object'
+    && typeof (result as { error?: unknown }).error === 'string'
+    && (result as { error: string }).error.trim().length > 0;
+}
 
 // ESM-compatible __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -44,6 +56,7 @@ export interface MCPServerOptions {
   tools?: string[] | 'all';
   daemonize?: boolean;
   timeout?: number;
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -66,6 +79,102 @@ export interface MCPServerStatus {
 }
 
 /**
+ * Durable identity of the instance that wrote the PID record (#3364).
+ *
+ * A PID is liveness evidence, not identity. The number only means anything in
+ * the PID namespace that issued it, and the OS hands it out again once the
+ * process is reaped, so `kill -0` alone cannot tell "the server we recorded"
+ * from "whatever now holds that number". The record therefore carries what
+ * stays true for one instance — host, OS, Linux PID namespace and kernel boot,
+ * and the owner's own process start time — and a recorded PID is believed only
+ * while all of it still matches. Same identity model as #3363 for the policy
+ * lock (`src/services/policy-runtime.ts`), which compares the lock's bytes
+ * rather than a stat triple for the same reason.
+ */
+interface PidFileIdentity {
+  v: 1;
+  pid: number;
+  host: string;
+  platform: string;
+  pidns?: string;
+  boot?: string;
+  start?: string;
+  transport?: string;
+  port?: number;
+  startedAt?: string;
+}
+
+interface PidFileRecord {
+  pid: number;
+  raw: string;
+  identity?: PidFileIdentity;
+}
+
+/**
+ * Linux PID namespace of this process, e.g. `pid:[4026531836]`; undefined on
+ * other platforms or without /proc. A PID from another namespace (a container,
+ * a `bwrap --unshare-pid` sandbox) names a different process here.
+ */
+const PID_NAMESPACE = ((): string | undefined => {
+  try {
+    return fs.readlinkSync('/proc/self/ns/pid');
+  } catch {
+    return undefined;
+  }
+})();
+
+/**
+ * Linux boot id: one uuid per kernel boot, shared by every process on that
+ * kernel and readable inside containers. `host` is only a name, and many
+ * distributions keep /tmp across a reboot — ADR-071 already names
+ * `/tmp/claude-flow-mcp.pid` as machine-wide on Linux — so without this a
+ * record written before the machine came back up looks exactly like a live one.
+ */
+const BOOT_ID = ((): string | undefined => {
+  try {
+    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+  } catch {
+    return undefined;
+  }
+})();
+
+/**
+ * A token that changes when a PID is handed to a different process: the
+ * owner's start time.
+ *
+ * Linux reports it in /proc/<pid>/stat field 22 as clock ticks since boot,
+ * which is durable together with BOOT_ID above. Elsewhere `ps -o lstart=`
+ * reports an absolute wall-clock time, durable on its own. Returns undefined
+ * where neither exists — on Windows, so PID reuse stays unqualified there,
+ * exactly as isProcessRunning()'s process-name check already is.
+ */
+function processStartToken(pid: number): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  // DA-CRIT-3: validate the PID numerically and pass it as an argv entry,
+  // never interpolated into a shell string.
+  const safePid = String(Math.floor(pid));
+  try {
+    // `pid (comm) state ppid ...` — comm is parenthesised and may itself
+    // contain spaces and parentheses, so parse after the last ')'.
+    const stat = fs.readFileSync(`/proc/${safePid}/stat`, 'utf8');
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const starttime = afterComm[19];
+    if (starttime && /^\d+$/.test(starttime)) return starttime;
+  } catch {
+    // Not Linux, or no /proc — fall through to ps.
+  }
+  try {
+    const lstart = execFileSync('ps', ['-p', safePid, '-o', 'lstart='], {
+      encoding: 'utf8',
+      timeout: 1000,
+    }).trim();
+    return lstart || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Default configuration
  */
 const DEFAULT_OPTIONS: Required<MCPServerOptions> = {
@@ -77,7 +186,72 @@ const DEFAULT_OPTIONS: Required<MCPServerOptions> = {
   tools: 'all',
   daemonize: false,
   timeout: 30000,
+  requestTimeoutMs: 30000,
 };
+
+export function parseMcpToolSelection(value: string | undefined): string[] | 'all' {
+  if (!value || value.trim().toLowerCase() === 'all') return 'all';
+  const selectors = value.split(',').map((item) => item.trim()).filter(Boolean);
+  return selectors.length > 0 ? selectors : 'all';
+}
+
+/**
+ * Apply the existing `--tools` contract to advertised schemas. A selector can
+ * be an exact tool name, a category, or a namespace prefix (`memory` matches
+ * `memory_store`). Execution remains registered internally; only the fixed
+ * per-request schema catalogue is reduced.
+ */
+export function filterAdvertisedMcpTools<T extends { name: string; category?: string }>(
+  tools: T[],
+  selection: string[] | 'all',
+): T[] {
+  if (selection === 'all') return tools;
+  const selectors = new Set(selection.map((item) => item.toLowerCase()));
+  return tools.filter((tool) => {
+    const name = tool.name.toLowerCase();
+    const category = tool.category?.toLowerCase();
+    return selectors.has(name)
+      || (category !== undefined && selectors.has(category))
+      || Array.from(selectors).some((selector) => name.startsWith(`${selector}_`));
+  });
+}
+
+export interface McpSchemaOverhead {
+  toolCount: number;
+  bytes: number;
+  estimatedTokens: number;
+  contextWindowTokens?: number;
+  ratio?: number;
+  risk: 'normal' | 'high';
+}
+
+/** Conservative JSON-size estimate for the fixed tools/list catalogue. */
+export function assessMcpSchemaOverhead(
+  tools: Array<{ name: string; description?: string; inputSchema?: unknown }>,
+  contextWindowTokens?: number,
+): McpSchemaOverhead {
+  const catalogue = tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+  }));
+  const bytes = Buffer.byteLength(JSON.stringify(catalogue), 'utf8');
+  const estimatedTokens = Math.ceil(bytes / 4);
+  const validWindow = Number.isFinite(contextWindowTokens) && Number(contextWindowTokens) > 0
+    ? Number(contextWindowTokens)
+    : undefined;
+  const ratio = validWindow ? estimatedTokens / validWindow : undefined;
+  return {
+    toolCount: tools.length,
+    bytes,
+    estimatedTokens,
+    ...(validWindow === undefined ? {} : { contextWindowTokens: validWindow }),
+    ...(ratio === undefined ? {} : { ratio }),
+    risk: (ratio !== undefined ? ratio >= 0.2 : estimatedTokens >= 8_000)
+      ? 'high'
+      : 'normal',
+  };
+}
 
 /**
  * MCP Server Manager
@@ -90,22 +264,68 @@ export class MCPServerManager extends EventEmitter {
   private server?: Server;
   private startTime?: Date;
   private healthCheckInterval?: NodeJS.Timeout;
+  private mcpServers: Array<{ stop(): Promise<void> }> = [];
+  /**
+   * This manager's own lifecycle (#3364). A stdio server keeps no PID record,
+   * so nothing on disk can answer "is this manager running?" — only the
+   * manager can. `idle` is a manager that has never started, and only there
+   * does the #2934 fallback in getStatus() ("assume a client-launched stdio
+   * server") apply; `stopped` is a handle on a server that is gone, and it
+   * says so rather than reporting whatever PID the shared file happens to hold.
+   */
+  private lifecycle: 'idle' | 'running' | 'stopped' = 'idle';
+  /**
+   * The exact bytes this manager wrote to the PID file, while they are still
+   * there (#3364). stop() retracts the record only while it is byte for byte
+   * the one we wrote: the slot may have changed hands in between.
+   */
+  private ownedRecord: string | null = null;
 
   constructor(options: MCPServerOptions = {}) {
     super();
-    this.options = { ...DEFAULT_OPTIONS, ...options };
+    // `options.tools`, populated by the `mcp start --tools` CLI flag, is
+    // spread last below and therefore takes precedence over this env fallback.
+    const environmentTools = parseMcpToolSelection(process.env.CLAUDE_FLOW_MCP_TOOLS);
+    this.options = {
+      ...DEFAULT_OPTIONS,
+      ...(environmentTools === 'all' ? {} : { tools: environmentTools }),
+      ...options,
+    };
   }
 
   /**
    * Start the MCP server
    */
   async start(): Promise<MCPServerStatus> {
-    // Check if already running (skip if status reports our own PID —
-    // getStatus() returns running=true for the current process in stdio mode
-    // even before the server is actually started)
-    const status = await this.getStatus();
-    if (status.running && status.pid !== process.pid) {
-      throw new Error(`MCP Server already running (PID: ${status.pid})`);
+    // #3364: the PID file is a single slot per os.tmpdir() (per user on
+    // macOS/Windows; the machine-wide /tmp on Linux unless TMPDIR is set), and
+    // it records the port-bound (http/websocket) server, where a second
+    // instance would conflict. A stdio server is owned by the client that
+    // spawned it and any number run side by side (one per MCP client or
+    // project), so a stdio server never claims that slot, and never refuses to
+    // start over — or clears — a live server's record. ADR-071 made this
+    // singleton safe against self-detection and PID reuse; a stdio server has
+    // no business claiming it at all. What it does instead is track its own
+    // lifecycle, because for a server that leaves no record that is the only
+    // evidence there is.
+    const usesPidFile = this.options.transport !== 'stdio';
+
+    // Refuse to start a second port-bound server over a live one. The record
+    // is read directly rather than through getStatus(), whose #2934 fallback
+    // answers about this process, not about the recorded server — and whose
+    // own PID would otherwise have to be filtered out again here.
+    if (usesPidFile) {
+      const record = await this.readPidRecord();
+      if (record && this.recordedServerIsLive(record)) {
+        if (record.pid !== process.pid) {
+          throw new Error(`MCP Server already running (PID: ${record.pid})`);
+        }
+      } else if (record) {
+        // Stale record — a dead PID, a PID since handed to another process, or
+        // an identity from another host, kernel boot or PID namespace. Cleaned
+        // up here, as the getStatus() call this replaced used to do.
+        await this.removePidFile();
+      }
     }
 
     const startTime = performance.now();
@@ -121,11 +341,14 @@ export class MCPServerManager extends EventEmitter {
         // For HTTP/WebSocket, start in-process server
         await this.startHttpServer();
       }
+      this.lifecycle = 'running';
 
       const duration = performance.now() - startTime;
 
-      // Write PID file
-      await this.writePidFile();
+      // Write PID file, and remember the bytes so stop() retracts only ours
+      if (usesPidFile) {
+        this.ownedRecord = await this.writePidFile();
+      }
 
       // Start health check monitoring
       this.startHealthMonitoring();
@@ -185,9 +408,25 @@ export class MCPServerManager extends EventEmitter {
         this.server = undefined;
       }
 
-      // Remove PID file
-      await this.removePidFile();
+      if (this.mcpServers.length > 0) {
+        const servers = this.mcpServers;
+        this.mcpServers = [];
+        await Promise.all(servers.map((server) => server.stop()));
+      }
 
+      // #3364: retract the record only if this manager wrote it, and only
+      // while it is still ours byte for byte — another server may have taken
+      // the slot. A live stdio server wrote nothing, so it has nothing to
+      // retract; a manager that never started — the one `mcp stop` builds —
+      // still clears the recorded server, exactly as before.
+      if (this.ownedRecord !== null) {
+        await this.removePidFile(this.ownedRecord);
+      } else if (this.lifecycle !== 'running' || this.options.transport !== 'stdio') {
+        await this.removePidFile();
+      }
+
+      this.lifecycle = 'stopped';
+      this.ownedRecord = null;
       this.startTime = undefined;
       this.emit('stopped');
     } catch (error) {
@@ -200,10 +439,30 @@ export class MCPServerManager extends EventEmitter {
    * Get server status
    */
   async getStatus(): Promise<MCPServerStatus> {
-    // Check PID file
-    const pid = await this.readPidFile();
+    // #3364: this manager's own lifecycle is the authority on this manager.
+    // While it is serving stdio it IS the server — it never wrote a record, so
+    // a recorded PID belongs to somebody else. Once it has stopped it is not
+    // running, whatever the record says. The marker is live lifecycle, not a
+    // one-way "has served stdio" flag that survives the server it described.
+    if (this.lifecycle === 'running' && this.options.transport === 'stdio') {
+      return {
+        running: true,
+        pid: process.pid,
+        transport: 'stdio',
+        startedAt: this.startTime?.toISOString(),
+        uptime: this.startTime
+          ? Math.floor((Date.now() - this.startTime.getTime()) / 1000)
+          : undefined,
+      };
+    }
+    if (this.lifecycle === 'stopped') {
+      return { running: false };
+    }
 
-    if (!pid) {
+    // Check PID file
+    const record = await this.readPidRecord();
+
+    if (!record) {
       // No PID file found. Detect if we are running in stdio mode
       // (e.g., launched by Claude Code via `claude mcp add`).
       const isStdio = !process.stdin.isTTY;
@@ -222,10 +481,8 @@ export class MCPServerManager extends EventEmitter {
       return { running: false };
     }
 
-    // Check if process is running
-    const isRunning = this.isProcessRunning(pid);
-
-    if (!isRunning) {
+    // Check that the recorded server is still the instance the record names
+    if (!this.recordedServerIsLive(record)) {
       // Clean up stale PID file
       await this.removePidFile();
       return { running: false };
@@ -234,7 +491,7 @@ export class MCPServerManager extends EventEmitter {
     // Build status
     const status: MCPServerStatus = {
       running: true,
-      pid,
+      pid: record.pid,
       transport: this.options.transport,
       host: this.options.host,
       port: this.options.port,
@@ -261,12 +518,23 @@ export class MCPServerManager extends EventEmitter {
     metrics?: Record<string, number>;
   }> {
     if (this.options.transport === 'stdio') {
-      // For stdio, check if process is running
-      const pid = await this.readPidFile();
-      if (pid === null) {
+      // #3364: while this manager is serving stdio it IS the server, so it is
+      // healthy by definition and must not read — or, from the 30s monitor in
+      // startHealthMonitoring(), clear — the record it deliberately never
+      // wrote. Once it has stopped it is not healthy either: it is a handle on
+      // a dead server, not a window onto whatever PID the shared file holds.
+      if (this.lifecycle === 'running') {
+        return { healthy: true };
+      }
+      if (this.lifecycle === 'stopped') {
+        return { healthy: false, error: 'Server stopped' };
+      }
+      // For stdio, check if the recorded process is running
+      const record = await this.readPidRecord();
+      if (record === null) {
         return { healthy: false, error: 'No PID file found' };
       }
-      if (!this.isProcessRunning(pid)) {
+      if (!this.recordedServerIsLive(record)) {
         // Clean up stale PID file
         await this.removePidFile();
         return { healthy: false, error: 'Process not running (cleaned up stale PID)' };
@@ -309,6 +577,66 @@ export class MCPServerManager extends EventEmitter {
    * Handles stdin/stdout directly like V2 implementation
    */
   private async startStdioServer(): Promise<void> {
+    // ruflo#1910 — protect the JSON-RPC stdout from any stray
+    // console.log/info/debug emitted by lazily-loaded modules
+    // (@ruvector/router, @claude-flow/neural, transformers.js, ONNX,
+    // semantic-router init, etc.). Codex closes the MCP transport
+    // the moment it sees a non-JSON line on stdout, and one such
+    // line during a tool batch bricked the whole session.
+    //
+    // Strategy: replace console.log/info/debug with stderr writers
+    // for the rest of the process. JSON-RPC frames go out via the
+    // dedicated `writeFrame()` helper below (process.stdout.write
+    // with the original native binding, NOT console.log), so the
+    // hijack can't accidentally redirect protocol frames too.
+    process.env.MCP_STDIO_MODE = '1';
+    const originalLog = console.log;  // eslint-disable-line no-console
+    console.log = (...args: unknown[]) => process.stderr.write('[stdout→stderr] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+    console.info = (...args: unknown[]) => process.stderr.write('[stdout→stderr] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+    console.debug = (...args: unknown[]) => process.stderr.write('[stdout→stderr] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+
+    // #2426 — Force blocking writes on stdout so JSON-RPC frames larger than
+    // the OS pipe buffer (64KB on macOS) are delivered atomically. Without
+    // this, `process.stdout.write()` returns after a partial write when the
+    // pipe buffer is full; the truncated frame is unparseable JSON and the
+    // MCP client (Claude Code) silently drops all 314 tools. The MCP SDK's
+    // StdioServerTransport does the same thing for this reason. `setBlocking`
+    // is an internal Node API but stable since v10 and used in many MCP
+    // implementations; we feature-gate it so we degrade gracefully on
+    // exotic stdout handles (e.g., when not bound to a pipe in tests).
+    const stdoutHandle = (process.stdout as unknown as {
+      _handle?: { setBlocking?: (b: boolean) => void };
+    })._handle;
+    if (stdoutHandle && typeof stdoutHandle.setBlocking === 'function') {
+      stdoutHandle.setBlocking(true);
+    }
+    // Same for stderr — long structured error messages can also exceed the
+    // pipe buffer and tearing those mid-message corrupts the client's log view.
+    const stderrHandle = (process.stderr as unknown as {
+      _handle?: { setBlocking?: (b: boolean) => void };
+    })._handle;
+    if (stderrHandle && typeof stderrHandle.setBlocking === 'function') {
+      stderrHandle.setBlocking(true);
+    }
+
+    /** Send a single JSON-RPC frame to the real stdout. Use this instead
+     * of `console.log` so the hijack above can't redirect protocol frames. */
+    const writeFrame = (msg: unknown): void => {
+      process.stdout.write(JSON.stringify(msg) + '\n');
+    };
+    // Reference originalLog to keep the eslint-disable meaningful — also
+    // gives us an escape hatch if a test wants to verify it was replaced.
+    void originalLog;
+
+    // Catch fatal errors that would otherwise close the transport
+    // mid-batch with no JSON-RPC error returned to the client.
+    process.on('uncaughtException', (err) => {
+      process.stderr.write(`[mcp-stdio] uncaughtException: ${err.stack || err.message}\n`);
+    });
+    process.on('unhandledRejection', (reason) => {
+      process.stderr.write(`[mcp-stdio] unhandledRejection: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}\n`);
+    });
+
     // Import the tool registry
     const { listMCPTools, callMCPTool, hasTool } = await import('./mcp-client.js');
 
@@ -364,7 +692,7 @@ export class MCPServerManager extends EventEmitter {
     }));
 
     // Send server initialization notification
-    console.log(JSON.stringify({
+    writeFrame({
       jsonrpc: '2.0',
       method: 'server.initialized',
       params: {
@@ -377,7 +705,7 @@ export class MCPServerManager extends EventEmitter {
           },
         },
       },
-    }));
+    });
 
     // Handle stdin messages (S-5: bounded buffer to prevent OOM)
     const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB
@@ -391,10 +719,10 @@ export class MCPServerManager extends EventEmitter {
           `[${new Date().toISOString()}] ERROR [claude-flow-mcp] Buffer exceeded ${MAX_BUFFER_SIZE} bytes, rejecting`
         );
         buffer = '';
-        console.log(JSON.stringify({
+        writeFrame({
           jsonrpc: '2.0',
           error: { code: -32600, message: 'Request too large' },
-        }));
+        });
         return;
       }
 
@@ -408,7 +736,7 @@ export class MCPServerManager extends EventEmitter {
             const message = JSON.parse(line);
             const response = await this.handleMCPMessage(message, sessionId);
             if (response) {
-              console.log(JSON.stringify(response));
+              writeFrame(response);
             }
           } catch (error) {
             console.error(
@@ -482,7 +810,7 @@ export class MCPServerManager extends EventEmitter {
           };
 
         case 'tools/list':
-          const tools = listMCPTools();
+          const tools = filterAdvertisedMcpTools(listMCPTools(), this.options.tools);
           return {
             jsonrpc: '2.0',
             id: message.id,
@@ -507,13 +835,26 @@ export class MCPServerManager extends EventEmitter {
             };
           }
 
+          if (isPolicyEnforcementEnabled()) {
+            const check = evaluateToolCall(loadMcpPolicy(), sessionId, toolName);
+            if (!check.allowed) {
+              trackRequest(toolName, false);
+              return {
+                jsonrpc: '2.0',
+                id: message.id,
+                error: { code: -32001, message: `Policy denied: ${check.reason}` },
+              };
+            }
+          }
+
           try {
             const result = await callMCPTool(toolName, toolParams, { sessionId });
-            trackRequest(toolName, true);
+            const isError = hasToolError(result);
+            trackRequest(toolName, !isError);
             return {
               jsonrpc: '2.0',
               id: message.id,
-              result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
+              result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError },
             };
           } catch (error) {
             trackRequest(toolName, false);
@@ -579,23 +920,58 @@ export class MCPServerManager extends EventEmitter {
       error: (msg: string, data?: unknown) => this.emit('log', { level: 'error', msg, data }),
     };
 
+    const { listMCPTools, callMCPTool } = await import('./mcp-client.js');
+    const fallbackSessionId = `http-${randomUUID()}`;
+    const cliTools = filterAdvertisedMcpTools(listMCPTools(), this.options.tools).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      category: tool.category,
+      tags: tool.tags,
+      version: tool.version,
+      cacheable: tool.cacheable,
+      cacheTTL: tool.cacheTTL,
+      handler: async (input: unknown, context?: { sessionId?: string }) => {
+        try {
+          const result = await callMCPTool(
+            tool.name,
+            (input as Record<string, unknown>) || {},
+            { sessionId: context?.sessionId || fallbackSessionId }
+          );
+          trackRequest(tool.name, !hasToolError(result));
+          return result;
+        } catch (error) {
+          trackRequest(tool.name, false);
+          throw error;
+        }
+      },
+    }));
+
+    // Use one MCP server with two HTTP transports for the localhost default.
+    // Both loopback sockets therefore share sessions, tools, and notifications.
+    const dualLoopback = this.options.host === 'localhost';
     const mcpServer = createMCPServer(
       {
         name: 'Claude-Flow MCP Server V3',
         version: '3.0.0',
         transport: this.options.transport as 'http' | 'websocket',
-        host: this.options.host,
+        host: dualLoopback ? '127.0.0.1' : this.options.host,
+        additionalHosts: dualLoopback && this.options.transport === 'http' ? ['::1'] : undefined,
         port: this.options.port,
         enableMetrics: true,
         enableCaching: true,
+        requestTimeout: this.options.requestTimeoutMs,
       },
       logger
     );
-
+    const registration = mcpServer.registerTools(
+      cliTools as Parameters<typeof mcpServer.registerTools>[0]
+    );
+    if (registration.failed.length > 0) {
+      throw new Error(`Failed to register MCP tools: ${registration.failed.join(', ')}`);
+    }
     await mcpServer.start();
-
-    // Store reference for stopping
-    (this as any)._mcpServer = mcpServer;
+    this.mcpServers = [mcpServer];
   }
 
   /**
@@ -658,34 +1034,117 @@ export class MCPServerManager extends EventEmitter {
   }
 
   /**
-   * Write PID file
+   * Write the PID record.
+   *
+   * Line 1 is the bare PID, byte for byte what this file has always held, so
+   * every existing reader keeps working: an older ruflo's
+   * `parseInt(content.trim(), 10)` stops at the newline, and
+   * `v3/scripts/start-mcp.sh` reads the first line. Line 2 is the durable
+   * identity of the instance that wrote it (#3364). Returns the bytes written,
+   * which stop() uses to retract only its own record.
    */
-  private async writePidFile(): Promise<void> {
+  private async writePidFile(): Promise<string> {
     const pid = this.process?.pid || process.pid;
-    await fs.promises.writeFile(this.options.pidFile, String(pid), 'utf8');
+    const identity: PidFileIdentity = {
+      v: 1,
+      pid,
+      host: os.hostname(),
+      platform: process.platform,
+      pidns: PID_NAMESPACE,
+      boot: BOOT_ID,
+      start: processStartToken(pid),
+      transport: this.options.transport,
+      port: this.options.port,
+      startedAt: (this.startTime ?? new Date()).toISOString(),
+    };
+    const record = `${pid}\n${JSON.stringify(identity)}\n`;
+    await fs.promises.writeFile(this.options.pidFile, record, 'utf8');
+    return record;
   }
 
   /**
-   * Read PID file
+   * Read the PID record.
+   *
+   * A bare-integer file — an older ruflo, `start-mcp.sh --daemon`, or a
+   * hand-written one — parses to a record with no identity, which keeps
+   * exactly the old behaviour: the PID is checked for liveness and nothing
+   * more. An identity line is only believed for the PID it names.
    */
-  private async readPidFile(): Promise<number | null> {
+  private async readPidRecord(): Promise<PidFileRecord | null> {
     try {
-      const content = await fs.promises.readFile(this.options.pidFile, 'utf8');
-      const pid = parseInt(content.trim(), 10);
-      return isNaN(pid) ? null : pid;
+      const raw = await fs.promises.readFile(this.options.pidFile, 'utf8');
+      const newline = raw.indexOf('\n');
+      const pid = parseInt((newline === -1 ? raw : raw.slice(0, newline)).trim(), 10);
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+
+      let identity: PidFileIdentity | undefined;
+      const rest = newline === -1 ? '' : raw.slice(newline + 1).trim();
+      if (rest) {
+        try {
+          const parsed = JSON.parse(rest) as PidFileIdentity | null;
+          if (parsed && parsed.v === 1 && parsed.pid === pid) identity = parsed;
+        } catch {
+          // Truncated, or a second line we don't recognise — PID only.
+        }
+      }
+      return { pid, raw, identity };
     } catch {
       return null;
     }
   }
 
   /**
-   * Remove PID file
+   * Is the recorded server still the instance the record names? (#3364)
+   *
+   * `kill -0`, and isProcessRunning()'s process-name check on top of it, only
+   * answer "something with this number is alive". Durable identity answers
+   * "it is still the one we wrote down":
+   *  - another host, OS, kernel boot or PID namespace issues its own PIDs, so
+   *    the number says nothing here. On Linux this is the ordinary stale case,
+   *    because /tmp commonly survives a reboot;
+   *  - within one boot the OS reuses a PID once the process is reaped, and the
+   *    owner's start time is what tells the two apart.
+   * Where the start time cannot be read — Windows — the answer falls back to
+   * isProcessRunning(), i.e. exactly the evidence used today.
    */
-  private async removePidFile(): Promise<void> {
-    try {
-      await fs.promises.unlink(this.options.pidFile);
-    } catch {
-      // Ignore errors
+  private recordedServerIsLive(record: PidFileRecord): boolean {
+    const { pid, identity } = record;
+    if (identity) {
+      if (
+        identity.host !== os.hostname() ||
+        identity.platform !== process.platform ||
+        identity.pidns !== PID_NAMESPACE ||
+        identity.boot !== BOOT_ID
+      ) {
+        return false;
+      }
+      if (identity.start !== undefined) {
+        const start = processStartToken(pid);
+        if (start !== undefined && start !== identity.start) return false;
+      }
+    }
+    return this.isProcessRunning(pid);
+  }
+
+  /**
+   * Remove PID file. With `ownedRecord`, only while the file still holds
+   * exactly those bytes: the slot may have changed hands (#3364).
+   */
+  private async removePidFile(ownedRecord?: string): Promise<void> {
+    let ours = true;
+    if (ownedRecord !== undefined) {
+      try {
+        ours = (await fs.promises.readFile(this.options.pidFile, 'utf8')) === ownedRecord;
+      } catch {
+        ours = false; // Already gone
+      }
+    }
+    if (ours) {
+      try {
+        await fs.promises.unlink(this.options.pidFile);
+      } catch {
+        // Ignore errors
+      }
     }
     // Also clean up legacy PID file location from older versions
     try {

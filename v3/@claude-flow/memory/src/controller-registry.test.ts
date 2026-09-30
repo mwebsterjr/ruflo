@@ -404,6 +404,65 @@ describe('ControllerRegistry', () => {
       });
       expect(registry.isEnabled('learningBridge')).toBe(false);
     });
+
+    // Regression guard for ruvnet/ruflo#2019.
+    //
+    // agentdb@3.0.0-alpha.14's `getController()` switch only handles
+    // memory/reflexion/skills/causal/causalGraph and THROWS
+    // `Unknown controller: vectorBackend` for everything else. The
+    // registry's old try/catch silently swallowed that throw and
+    // returned null — so `vectorBackend` (and `graphAdapter`) reported
+    // `enabled: false` even though the field is right there on the
+    // agentdb instance. The fix probes `agentdb[name]` directly before
+    // falling back to getController.
+    it('vectorBackend/graphAdapter: prefers direct property over getController (issue #2019)', async () => {
+      const fakeVectorBackend = { kind: 'vectorBackend' };
+      const fakeGraphAdapter = { kind: 'graphAdapter' };
+      // Simulate agentdb@3.0.0-alpha.14: fields exist, but getController
+      // throws Unknown controller for anything not in the small switch.
+      const fakeAgentDb: any = {
+        vectorBackend: fakeVectorBackend,
+        graphAdapter: fakeGraphAdapter,
+        getController(name: string) {
+          if (name === 'memory' || name === 'reflexion') return null;
+          throw new Error(`Unknown controller: ${name}`);
+        },
+      };
+
+      await registry.initialize({
+        backend: mockBackend,
+        agentdb: fakeAgentDb,
+      });
+
+      // Both controllers must be reachable via the direct property
+      // probe, NOT silently null because getController threw.
+      expect(registry.get('vectorBackend')).toBe(fakeVectorBackend);
+      expect(registry.get('graphAdapter')).toBe(fakeGraphAdapter);
+      expect(registry.isEnabled('vectorBackend')).toBe(true);
+      expect(registry.isEnabled('graphAdapter')).toBe(true);
+    });
+
+    // Companion guard: if a future agentdb exposes these via
+    // getController instead of as direct fields, we must still find
+    // them — proves the fallback path stays intact.
+    it('vectorBackend: falls back to getController when no direct property exists (issue #2019)', async () => {
+      const fakeVectorBackend = { kind: 'vectorBackend-via-controller' };
+      const fakeAgentDb: any = {
+        // No `.vectorBackend` field at all.
+        getController(name: string) {
+          if (name === 'vectorBackend') return fakeVectorBackend;
+          return null;
+        },
+      };
+
+      await registry.initialize({
+        backend: mockBackend,
+        agentdb: fakeAgentDb,
+      });
+
+      expect(registry.get('vectorBackend')).toBe(fakeVectorBackend);
+      expect(registry.isEnabled('vectorBackend')).toBe(true);
+    });
   });
 
   // ----- Health Check -----
@@ -664,6 +723,23 @@ describe('ControllerRegistry', () => {
       // Just verify the listener doesn't break anything
     });
 
+    it('should emit controller:degraded with the reason hierarchicalMemory fell back (#2887)', async () => {
+      const degraded: Array<{ name: string; reason: string; persistence: string }> = [];
+      registry.on('controller:degraded', (e: any) => degraded.push(e));
+
+      await registry.initialize({
+        backend: mockBackend,
+        controllers: { hierarchicalMemory: true },
+      });
+
+      // agentdb dropped its HierarchicalMemory export at 3.0.0-alpha.17, so the
+      // tiered fallback is the live path. Taking it must be announced, not silent.
+      const hmDegraded = degraded.find((e) => e.name === 'hierarchicalMemory');
+      expect(hmDegraded).toBeDefined();
+      expect(hmDegraded!.reason).toBeTruthy();
+      expect(registry.getHierarchicalFallback()).toMatchObject({ reason: hmDegraded!.reason });
+    });
+
     it('should emit all lifecycle events', async () => {
       const events: string[] = [];
       registry.on('initialized', () => events.push('initialized'));
@@ -772,5 +848,134 @@ describe('HybridBackend proxy methods', () => {
     expect(result).toEqual([]);
 
     await backend.shutdown();
+  });
+});
+
+// ===== #3327 Finding A — ReasoningBank embedder contract =====
+//
+// agentdb's ReasoningBank calls `embedder.embedPassage()` on store and
+// `embedder.embedQuery()` on search. For months the registry handed it an
+// object exposing only {embed, embedBatch, initialize}, so BOTH paths threw
+// `TypeError: ... is not a function`. The bridge's catch swallowed the throw
+// and reported an ordinary fallback, so `agentdb_controllers` showed
+// `reasoningBank: enabled=true` while every read and write silently routed to
+// substring matching.
+//
+// Second, independent defect: the no-generator branch returned ZERO vectors,
+// so even with the method names shimmed every pattern embeds identically and
+// ranks on noise.
+
+describe('#3327 — embedder handed to agentdb controllers satisfies the asymmetric contract', () => {
+  // NOTE: the constructor takes no arguments — `config` is assigned by
+  // initialize(). Set it directly so these stay pure unit tests that do not
+  // need AgentDB, a database file, or a downloaded embedding model.
+  const makeRegistry = (config: Partial<RuntimeConfig> = {}) => {
+    const reg = new ControllerRegistry() as any;
+    reg.config = { dimension: 384, ...config } as RuntimeConfig;
+    return reg;
+  };
+
+  it('exposes embedQuery/embedPassage on the user-generator branch', async () => {
+    const reg = makeRegistry({ embeddingGenerator: async () => new Float32Array(384).fill(0.5) });
+    const svc = reg.createEmbeddingService();
+
+    for (const fn of ['embed', 'embedQuery', 'embedPassage', 'embedBatch']) {
+      expect(typeof svc[fn], `${fn} must exist — ReasoningBank calls it`).toBe('function');
+    }
+    // The aliases must return the generator's real vector, not a placeholder.
+    const q = await svc.embedQuery('hello');
+    expect(Array.from(q).some((x) => x !== 0)).toBe(true);
+  });
+
+  it('exposes embedQuery/embedPassage on the fallback stub branch too', () => {
+    const svc = makeRegistry().createEmbeddingService();
+    for (const fn of ['embed', 'embedQuery', 'embedPassage', 'embedBatch']) {
+      expect(typeof svc[fn], `${fn} missing => ReasoningBank throws at call time`).toBe('function');
+    }
+  });
+
+  it('marks the zero-vector stub so callers can refuse to rank on noise', async () => {
+    const svc = makeRegistry().createEmbeddingService();
+    expect(svc.isStubEmbedder).toBe(true);
+    const v = await svc.embedQuery('anything');
+    expect(Array.from(v).every((x) => x === 0)).toBe(true);
+  });
+
+  it('a real embeddingGenerator is NOT flagged as a stub', () => {
+    const reg = makeRegistry({ embeddingGenerator: async () => new Float32Array(384).fill(0.1) });
+    expect(reg.createEmbeddingService().isStubEmbedder).toBeUndefined();
+  });
+
+  it("prefers AgentDB's own embedder over the local service for reasoningBank", async () => {
+    const reg = makeRegistry();
+    const realEmbedder = {
+      embed: async () => new Float32Array(384).fill(0.25),
+      embedQuery: async () => new Float32Array(384).fill(0.25),
+      embedPassage: async () => new Float32Array(384).fill(0.25),
+    };
+    let handed: any = null;
+    reg.agentdb = { database: {}, embedder: realEmbedder };
+
+    // Stand in for agentdb's ReasoningBank so the assertion is about WHICH
+    // embedder the registry passes, not about agentdb being installed.
+    vi.doMock('agentdb', () => ({
+      ReasoningBank: class {
+        constructor(_db: unknown, embedder: unknown) { handed = embedder; }
+      },
+    }));
+
+    const inst = await reg.createController('reasoningBank').catch(() => null);
+    if (inst === null && handed === null) return; // agentdb not resolvable here — skip
+
+    expect(handed, 'registry must hand ReasoningBank a usable embedder').toBeTruthy();
+    expect(handed.isStubEmbedder, 'must NOT be the zero-vector stub').toBeUndefined();
+    expect(typeof handed.embedPassage).toBe('function');
+    expect(typeof handed.embedQuery).toBe('function');
+  });
+});
+
+describe('#3327 — adaptEmbedderForAgentdb covers the degraded-embedder path', () => {
+  const reg = () => new ControllerRegistry() as any;
+
+  it("aliases embed onto embedQuery/embedPassage for agentdb's mock embedder", async () => {
+    // When Transformers.js cannot load (offline, or a failed `sharp` optional
+    // install) agentdb substitutes a mock embedder exposing only `embed`.
+    // Passing that through untouched reintroduces the original crash — this
+    // case is why `?? createEmbeddingService()` alone was not sufficient.
+    const mock = { embed: async (t: string) => new Float32Array(384).fill(t.length || 1) };
+    const out = reg().adaptEmbedderForAgentdb(mock);
+
+    expect(typeof out.embedQuery).toBe('function');
+    expect(typeof out.embedPassage).toBe('function');
+    expect(typeof out.embedBatch).toBe('function');
+    expect(Array.from(await out.embedPassage('abc'))[0]).toBe(3);
+    expect(Array.from(await out.embedQuery('abcd'))[0]).toBe(4);
+  });
+
+  it('passes a already-complete embedder through untouched', () => {
+    const real = {
+      embed: async () => new Float32Array(1),
+      embedQuery: async () => new Float32Array(1),
+      embedPassage: async () => new Float32Array(1),
+    };
+    expect(reg().adaptEmbedderForAgentdb(real)).toBe(real);
+  });
+
+  it('returns null when there is nothing usable to adapt', () => {
+    const r = reg();
+    expect(r.adaptEmbedderForAgentdb(null)).toBeNull();
+    expect(r.adaptEmbedderForAgentdb(undefined)).toBeNull();
+    expect(r.adaptEmbedderForAgentdb({})).toBeNull();
+    expect(r.adaptEmbedderForAgentdb({ embed: 'not-a-function' })).toBeNull();
+  });
+
+  it('preserves a native embedBatch rather than serialising one call at a time', async () => {
+    let usedNative = false;
+    const withBatch = {
+      embed: async () => new Float32Array(1),
+      embedBatch: async (ts: string[]) => { usedNative = true; return ts.map(() => new Float32Array(1)); },
+    };
+    await reg().adaptEmbedderForAgentdb(withBatch).embedBatch(['a', 'b']);
+    expect(usedNative).toBe(true);
   });
 });

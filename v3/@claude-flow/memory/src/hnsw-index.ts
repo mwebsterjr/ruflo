@@ -270,8 +270,11 @@ export class HNSWIndex extends EventEmitter {
       ? this.quantizer.encode(vector)
       : vector;
 
-    // Pre-normalize vector for O(1) cosine similarity
-    const normalizedVector = this.config.metric === 'cosine'
+    // Pre-normalize vector for O(1) cosine similarity.
+    // Skipped for product quantization: storedVector holds PQ centroid
+    // indices, not embedding coordinates, so normalizing it is meaningless
+    // (and productQuantizeDistance() below never consults normalizedVector).
+    const normalizedVector = this.config.metric === 'cosine' && !this.isProductQuantized()
       ? this.normalizeVector(storedVector)
       : null;
 
@@ -335,8 +338,9 @@ export class HNSWIndex extends EventEmitter {
       ? this.quantizer.encode(query)
       : query;
 
-    // Pre-normalize query for O(1) cosine similarity
-    const normalizedQuery = this.config.metric === 'cosine'
+    // Pre-normalize query for O(1) cosine similarity (see addPoint() for why
+    // this is skipped under product quantization).
+    const normalizedQuery = this.config.metric === 'cosine' && !this.isProductQuantized()
       ? this.normalizeVector(queryVector)
       : null;
 
@@ -526,6 +530,214 @@ export class HNSWIndex extends EventEmitter {
    */
   get size(): number {
     return this.nodes.size;
+  }
+
+  /**
+   * Read-only view of the resolved HNSW config (dimensions, M, etc.).
+   * Used by {@link MemoryConsolidator.compactHnsw} to rebuild the index with
+   * matching parameters.
+   */
+  getConfig(): Readonly<HNSWConfig> {
+    return this.config;
+  }
+
+  // ===== Persistence (ADR-125 Phase 3) =====
+
+  /**
+   * Magic header for serialized HNSW snapshots.
+   * Format: "HNSW" + version byte (0x01).
+   */
+  static readonly SERIALIZATION_MAGIC = Buffer.from([0x48, 0x4e, 0x53, 0x57, 0x01]);
+
+  /**
+   * Serialize the index to a binary buffer.
+   *
+   * Layout (all integers big-endian):
+   * - 5 bytes:  magic header "HNSW" + version (0x01)
+   * - 4 bytes:  dimensions (uint32)
+   * - 4 bytes:  M (uint32)
+   * - 4 bytes:  efConstruction (uint32)
+   * - 4 bytes:  metric length (uint32) + metric utf-8 bytes
+   * - 4 bytes:  maxLevel (uint32)
+   * - 4 bytes:  entryPoint length (uint32) + entryPoint utf-8 bytes (0 = null)
+   * - 4 bytes:  node count (uint32)
+   * - per node:
+   *   - 4 bytes id length + id utf-8 bytes
+   *   - 4 bytes level
+   *   - 4 bytes vector length (in floats) + vector bytes (Float32, little-endian native)
+   *   - 1 byte  hasNormalized (0/1)
+   *   - if hasNormalized: 4 bytes normalized length + normalized bytes
+   *   - 4 bytes connection-level count
+   *   - per level:
+   *     - 4 bytes layer index
+   *     - 4 bytes neighbor count
+   *     - per neighbor: 4 bytes id length + id utf-8 bytes
+   */
+  serialize(): Buffer {
+    const chunks: Buffer[] = [];
+    chunks.push(HNSWIndex.SERIALIZATION_MAGIC);
+
+    // Config header
+    const header = Buffer.alloc(16);
+    header.writeUInt32BE(this.config.dimensions, 0);
+    header.writeUInt32BE(this.config.M, 4);
+    header.writeUInt32BE(this.config.efConstruction, 8);
+    header.writeUInt32BE(this.maxLevel, 12);
+    chunks.push(header);
+
+    chunks.push(this.encodeLengthPrefixedString(this.config.metric));
+    chunks.push(this.encodeLengthPrefixedString(this.entryPoint ?? ''));
+
+    const nodeCountBuf = Buffer.alloc(4);
+    nodeCountBuf.writeUInt32BE(this.nodes.size, 0);
+    chunks.push(nodeCountBuf);
+
+    for (const [id, node] of this.nodes) {
+      chunks.push(this.encodeLengthPrefixedString(id));
+
+      const meta = Buffer.alloc(4);
+      meta.writeUInt32BE(node.level, 0);
+      chunks.push(meta);
+
+      chunks.push(this.encodeFloat32Array(node.vector));
+
+      if (node.normalizedVector) {
+        chunks.push(Buffer.from([1]));
+        chunks.push(this.encodeFloat32Array(node.normalizedVector));
+      } else {
+        chunks.push(Buffer.from([0]));
+      }
+
+      const levels = [...node.connections.entries()];
+      const lvlCountBuf = Buffer.alloc(4);
+      lvlCountBuf.writeUInt32BE(levels.length, 0);
+      chunks.push(lvlCountBuf);
+
+      for (const [layer, neighbors] of levels) {
+        const layerBuf = Buffer.alloc(8);
+        layerBuf.writeUInt32BE(layer, 0);
+        layerBuf.writeUInt32BE(neighbors.size, 4);
+        chunks.push(layerBuf);
+        for (const neighborId of neighbors) {
+          chunks.push(this.encodeLengthPrefixedString(neighborId));
+        }
+      }
+    }
+
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Deserialize an HNSW index from a buffer produced by {@link serialize}.
+   *
+   * Throws on magic-header mismatch, version mismatch, or truncated input.
+   */
+  static deserialize(buf: Buffer): HNSWIndex {
+    if (buf.length < HNSWIndex.SERIALIZATION_MAGIC.length) {
+      throw new Error('HNSWIndex.deserialize: buffer too short for magic header');
+    }
+    for (let i = 0; i < HNSWIndex.SERIALIZATION_MAGIC.length; i++) {
+      if (buf[i] !== HNSWIndex.SERIALIZATION_MAGIC[i]) {
+        throw new Error(
+          `HNSWIndex.deserialize: magic header mismatch at byte ${i} (got 0x${buf[i].toString(16)}, expected 0x${HNSWIndex.SERIALIZATION_MAGIC[i].toString(16)})`
+        );
+      }
+    }
+
+    let offset = HNSWIndex.SERIALIZATION_MAGIC.length;
+
+    const dimensions = buf.readUInt32BE(offset); offset += 4;
+    const M = buf.readUInt32BE(offset); offset += 4;
+    const efConstruction = buf.readUInt32BE(offset); offset += 4;
+    const maxLevel = buf.readUInt32BE(offset); offset += 4;
+
+    const metricRead = readLengthPrefixedString(buf, offset);
+    offset = metricRead.offset;
+    const metric = metricRead.value as DistanceMetric;
+
+    const entryRead = readLengthPrefixedString(buf, offset);
+    offset = entryRead.offset;
+    const entryPoint = entryRead.value === '' ? null : entryRead.value;
+
+    const nodeCount = buf.readUInt32BE(offset); offset += 4;
+
+    const index = new HNSWIndex({
+      dimensions,
+      M,
+      efConstruction,
+      metric,
+    });
+    index.maxLevel = maxLevel;
+    index.entryPoint = entryPoint;
+
+    for (let n = 0; n < nodeCount; n++) {
+      const idRead = readLengthPrefixedString(buf, offset);
+      offset = idRead.offset;
+      const id = idRead.value;
+
+      const level = buf.readUInt32BE(offset); offset += 4;
+
+      const vecRead = readFloat32Array(buf, offset);
+      offset = vecRead.offset;
+      const vector = vecRead.value;
+
+      const hasNormalized = buf[offset]; offset += 1;
+      let normalizedVector: Float32Array | null = null;
+      if (hasNormalized) {
+        const normRead = readFloat32Array(buf, offset);
+        offset = normRead.offset;
+        normalizedVector = normRead.value;
+      }
+
+      const lvlCount = buf.readUInt32BE(offset); offset += 4;
+      const connections = new Map<number, Set<string>>();
+      for (let l = 0; l < lvlCount; l++) {
+        const layer = buf.readUInt32BE(offset); offset += 4;
+        const neighborCount = buf.readUInt32BE(offset); offset += 4;
+        const neighbors = new Set<string>();
+        for (let k = 0; k < neighborCount; k++) {
+          const neighborRead = readLengthPrefixedString(buf, offset);
+          offset = neighborRead.offset;
+          neighbors.add(neighborRead.value);
+        }
+        connections.set(layer, neighbors);
+      }
+
+      index.nodes.set(id, {
+        id,
+        vector,
+        normalizedVector,
+        connections,
+        level,
+      });
+    }
+
+    return index;
+  }
+
+  private encodeLengthPrefixedString(s: string): Buffer {
+    const strBuf = Buffer.from(s, 'utf-8');
+    const out = Buffer.alloc(4 + strBuf.length);
+    out.writeUInt32BE(strBuf.length, 0);
+    strBuf.copy(out, 4);
+    return out;
+  }
+
+  private encodeFloat32Array(arr: Float32Array): Buffer {
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(arr.length, 0);
+    const dataBuf = Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
+    return Buffer.concat([lenBuf, dataBuf]);
+  }
+
+  /**
+   * Remove a point from the index — alias for {@link removePoint}.
+   *
+   * Added by ADR-125 Phase 4 so {@link MemoryConsolidator} has a stable
+   * synchronous-shaped API to call. Internally delegates to {@link removePoint}.
+   */
+  async remove(id: string): Promise<boolean> {
+    return this.removePoint(id);
   }
 
   // ===== Private Methods =====
@@ -785,7 +997,49 @@ export class HNSWIndex extends EventEmitter {
     }
   }
 
+  /**
+   * True when this index uses product quantization with trained codebooks.
+   * Stored vectors are then PQ centroid indices, not embedding coordinates —
+   * generic metric distances (cosine/euclidean/dot/manhattan) computed
+   * directly on those indices are meaningless (index 5 vs index 200 has no
+   * relation to embedding-space proximity). Falls back to false during the
+   * pre-training bootstrap window (see Quantizer.productQuantize()), where
+   * stored vectors are still sub-vector-mean floats and generic distance,
+   * while imprecise, is not nonsensical — matching prior behavior exactly.
+   */
+  private isProductQuantized(): boolean {
+    return (
+      this.quantizer !== null &&
+      this.config.quantization?.type === 'product' &&
+      this.quantizer.isPQTrained
+    );
+  }
+
   private distance(a: Float32Array, b: Float32Array): number {
+    // Pre-existing, disclosed limitation (not introduced by this fix): any
+    // vector added before PQ codebook training completes is stored under a
+    // sub-vector-mean fallback encoding (see Quantizer.productQuantize())
+    // and is never re-encoded once training finishes — the original raw
+    // vector isn't retained. isValidPQEncoding() is a *plausibility*
+    // heuristic, not a proof of provenance: it structurally guards the
+    // crash/out-of-bounds case (fallback values outside codebook range, or
+    // non-integer), but a fallback encoding whose sub-vector means
+    // coincidentally land on small non-negative integers (most concretely,
+    // an all-zero or otherwise degenerate vector added pre-training) can
+    // still pass the check and be silently mis-dispatched to
+    // productQuantizeDistance() as if it were a real centroid assignment.
+    // Closing this fully would need per-node encoding-provenance tracking
+    // (e.g. a sentinel/flag threaded through HNSWNode and its persistence
+    // format), out of scope for this patch — flagged as a known residual
+    // risk, not treated as fully solved.
+    if (
+      this.isProductQuantized() &&
+      this.quantizer!.isValidPQEncoding(a) &&
+      this.quantizer!.isValidPQEncoding(b)
+    ) {
+      return this.quantizer!.productQuantizeDistance(a, b);
+    }
+
     switch (this.config.metric) {
       case 'cosine':
         return this.cosineDistance(a, b);
@@ -1104,14 +1358,17 @@ class Quantizer {
    * Compute approximate squared Euclidean distance between two PQ-encoded
    * vectors using their centroid indices and the shared codebooks.
    *
-   * @param encoded1 - Centroid indices for vector 1 (length = numSubquantizers)
+   * @param encoded1 - Centroid indices for vector 1 (length = numSubquantizers).
+   *   Typed Float32Array to match productQuantize()'s actual return type —
+   *   indices are small integers (0..codebookSize-1) exactly representable
+   *   in float32.
    * @param encoded2 - Centroid indices for vector 2 (length = numSubquantizers)
    * @param codebooks - Trained codebooks from trainProductQuantizer()
    * @returns Approximate squared Euclidean distance
    */
   productQuantizeDistance(
-    encoded1: Uint8Array,
-    encoded2: Uint8Array,
+    encoded1: Float32Array,
+    encoded2: Float32Array,
     codebooks?: number[][][],
   ): number {
     const cb = codebooks || this.codebooks;
@@ -1204,6 +1461,67 @@ class Quantizer {
   getCodebooks(): number[][][] | null {
     return this.codebooks;
   }
+
+  /**
+   * True when `encoded` looks like a real trained-codebook PQ encoding
+   * (length matches numSubquantizers, every value is a non-negative integer
+   * in range for its sub-quantizer's codebook). False for the pre-training
+   * sub-vector-mean fallback (see productQuantize()), which cannot be
+   * compared via productQuantizeDistance() without corrupting results or
+   * indexing out of bounds.
+   */
+  isValidPQEncoding(encoded: Float32Array): boolean {
+    if (!this.codebooks || encoded.length !== this.codebooks.length) return false;
+    for (let m = 0; m < encoded.length; m++) {
+      const idx = encoded[m];
+      if (!Number.isInteger(idx) || idx < 0 || idx >= this.codebooks[m].length) return false;
+    }
+    return true;
+  }
+}
+
+// ===== Persistence Helpers (ADR-125 Phase 3) =====
+
+function readLengthPrefixedString(
+  buf: Buffer,
+  offset: number
+): { value: string; offset: number } {
+  if (offset + 4 > buf.length) {
+    throw new Error(`HNSWIndex.deserialize: truncated string length at offset ${offset}`);
+  }
+  const len = buf.readUInt32BE(offset);
+  const start = offset + 4;
+  const end = start + len;
+  if (end > buf.length) {
+    throw new Error(
+      `HNSWIndex.deserialize: truncated string payload at offset ${offset} (needed ${len} bytes, have ${buf.length - start})`
+    );
+  }
+  const value = buf.toString('utf-8', start, end);
+  return { value, offset: end };
+}
+
+function readFloat32Array(
+  buf: Buffer,
+  offset: number
+): { value: Float32Array; offset: number } {
+  if (offset + 4 > buf.length) {
+    throw new Error(`HNSWIndex.deserialize: truncated array length at offset ${offset}`);
+  }
+  const floatCount = buf.readUInt32BE(offset);
+  const start = offset + 4;
+  const byteLen = floatCount * 4;
+  const end = start + byteLen;
+  if (end > buf.length) {
+    throw new Error(
+      `HNSWIndex.deserialize: truncated array payload at offset ${offset} (needed ${byteLen} bytes, have ${buf.length - start})`
+    );
+  }
+  // Copy into a fresh ArrayBuffer so Float32Array isn't a view onto the original
+  // (de-aligned) Node Buffer pool.
+  const copy = new ArrayBuffer(byteLen);
+  new Uint8Array(copy).set(new Uint8Array(buf.buffer, buf.byteOffset + start, byteLen));
+  return { value: new Float32Array(copy), offset: end };
 }
 
 export default HNSWIndex;

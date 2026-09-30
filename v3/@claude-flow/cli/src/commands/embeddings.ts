@@ -125,8 +125,16 @@ const searchCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const query = ctx.flags.query as string;
     const namespace = ctx.flags.collection as string || 'default';
-    const limit = parseInt(ctx.flags.limit as string || '10', 10);
-    const threshold = parseFloat(ctx.flags.threshold as string || '0.5');
+    // #2790 fix — `||` on a numeric-0 argument returns the fallback,
+    // so `--threshold 0` was unreachable. `??` preserves an explicit zero.
+    // The flag arrives as a string here (parser produces string for typed
+    // options passed via CLI without type coercion in some paths), so we
+    // check for undefined explicitly rather than falsy.
+    const limit = parseInt((ctx.flags.limit as string) ?? '10', 10);
+    const rawThreshold = ctx.flags.threshold;
+    const threshold = rawThreshold === undefined || rawThreshold === null
+      ? 0.5
+      : parseFloat(String(rawThreshold));
     const dbPath = ctx.flags['db-path'] as string || '.swarm/memory.db';
 
     if (!query) {
@@ -550,14 +558,14 @@ const indexCommand: Command = {
   description: 'Manage HNSW indexes',
   options: [
     { name: 'action', short: 'a', type: 'string', description: 'Action: build, rebuild, status, optimize', default: 'status' },
-    { name: 'collection', short: 'c', type: 'string', description: 'Collection/namespace name' },
+    { name: 'collection', short: 'c', type: 'string', description: 'Collection/namespace label (informational; HNSW is a single global index across all namespaces). Omit to build for all namespaces (#1947 RC2).' },
     { name: 'ef-construction', type: 'number', description: 'HNSW ef_construction parameter', default: '200' },
     { name: 'm', type: 'number', description: 'HNSW M parameter', default: '16' },
   ],
   examples: [
     { command: 'claude-flow embeddings index', description: 'Show index status' },
-    { command: 'claude-flow embeddings index -a build -c documents', description: 'Build index' },
-    { command: 'claude-flow embeddings index -a optimize -c patterns', description: 'Optimize index' },
+    { command: 'claude-flow embeddings index -a build', description: 'Build index from all namespaces' },
+    { command: 'claude-flow embeddings index -a rebuild -c project', description: 'Rebuild (label as `project`)' },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const action = ctx.flags.action as string || 'status';
@@ -571,6 +579,15 @@ const indexCommand: Command = {
 
     try {
       const { getHNSWStatus, getHNSWIndex, searchHNSWIndex, generateEmbedding } = await import('../memory/memory-initializer.js');
+
+      // Trigger lazy initialization before reading status, otherwise the
+      // singleton stays null and produces a misleading "@ruvector/core not
+      // available" warning even when the package is present (#1698).
+      await getHNSWIndex().catch(() => null);
+
+      // Probe whether @ruvector/core is loadable so we can distinguish
+      // "package missing" from "package present but index empty".
+      const ruvectorAvailable = await import('@ruvector/core').then(() => true).catch(() => false);
 
       // Get real HNSW status
       const status = getHNSWStatus();
@@ -615,10 +632,15 @@ const indexCommand: Command = {
             `  Speedup: ~${Math.round(speedup)}x`,
             `  Results: ${results?.length || 0} matches`,
           ].join('\n'), 'Search Performance');
-        } else if (!status.available) {
+        } else if (!status.available && !ruvectorAvailable) {
           output.writeln();
           output.printWarning('@ruvector/core not available');
           output.printInfo('Install: npm install @ruvector/core');
+        } else if (!status.available) {
+          output.writeln();
+          output.printWarning('HNSW index not initialized (but @ruvector/core is installed)');
+          output.printInfo('This usually means no embeddings have been stored yet.');
+          output.printInfo('Run: claude-flow memory store -k "key" --value "text"');
         } else {
           output.writeln();
           output.printInfo('Index is empty. Store some entries to populate it.');
@@ -630,12 +652,16 @@ const indexCommand: Command = {
 
       // Build/Rebuild action
       if (action === 'build' || action === 'rebuild') {
-        if (!collection) {
-          output.printError('Collection is required for build/rebuild');
-          return { success: false, exitCode: 1 };
-        }
+        // #1947 RC #2: `-c` is informational — the HNSW index is global
+        // and indexes every namespace's embeddings in one structure. The
+        // earlier code REQUIRED `-c` for build/rebuild AND its examples
+        // suggested `-c default`, which silently produced 0 vectors when a
+        // user's entries lived under a different namespace (e.g. `project`,
+        // `claude-memories`). Treat omitted `-c` as "all namespaces"
+        // (the actual runtime behavior) and tell the user as much.
+        const label = collection ?? '(all namespaces)';
 
-        const spinner = output.createSpinner({ text: `${action}ing index for ${collection}...`, spinner: 'dots' });
+        const spinner = output.createSpinner({ text: `${action}ing index for ${label}...`, spinner: 'dots' });
         spinner.start();
 
         // Force rebuild if requested
@@ -652,13 +678,19 @@ const indexCommand: Command = {
         const newStatus = getHNSWStatus();
         output.writeln();
         output.printBox([
-          `Collection: ${collection}`,
+          `Collection: ${label}`,
           `Action: ${action}`,
           `Vectors: ${newStatus.entryCount}`,
           `Dimensions: ${newStatus.dimensions}`,
           `M: ${m}`,
           `ef_construction: ${efConstruction}`,
         ].join('\n'), 'Index Built');
+
+        if (!collection && newStatus.entryCount === 0) {
+          output.writeln();
+          output.printInfo('No vectors indexed. Store some entries first:');
+          output.printInfo('  claude-flow memory store -k "key" --value "text" --namespace <ns>');
+        }
 
         return { success: true, data: newStatus };
       }
@@ -684,7 +716,7 @@ const initCommand: Command = {
   name: 'init',
   description: 'Initialize embedding subsystem with ONNX model and hyperbolic config',
   options: [
-    { name: 'model', short: 'm', type: 'string', description: 'ONNX model ID', default: 'Xenova/all-MiniLM-L6-v2' },
+    { name: 'model', short: 'm', type: 'string', description: 'ONNX model ID', default: 'all-MiniLM-L6-v2' },
     { name: 'hyperbolic', type: 'boolean', description: 'Enable hyperbolic (Poincaré ball) embeddings', default: 'true' },
     { name: 'curvature', short: 'c', type: 'string', description: 'Poincaré ball curvature (use --curvature=-1 for negative)', default: '-1' },
     { name: 'download', short: 'd', type: 'boolean', description: 'Download model during init', default: 'true' },
@@ -693,13 +725,13 @@ const initCommand: Command = {
   ],
   examples: [
     { command: 'claude-flow embeddings init', description: 'Initialize with defaults' },
-    { command: 'claude-flow embeddings init --model Xenova/all-mpnet-base-v2', description: 'Use higher quality model' },
+    { command: 'claude-flow embeddings init --model all-mpnet-base-v2', description: 'Use higher quality model' },
     { command: 'claude-flow embeddings init --no-hyperbolic', description: 'Euclidean only' },
     { command: 'claude-flow embeddings init --curvature=-0.5', description: 'Custom curvature (use = for negative)' },
     { command: 'claude-flow embeddings init --force', description: 'Overwrite existing config' },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
-    const model = ctx.flags.model as string || 'Xenova/all-MiniLM-L6-v2';
+    const model = ctx.flags.model as string || 'all-MiniLM-L6-v2';
     const hyperbolic = ctx.flags.hyperbolic !== false;
     const download = ctx.flags.download !== false;
     const force = ctx.flags.force === true;
@@ -744,7 +776,13 @@ const initCommand: Command = {
         fs.mkdirSync(modelDir, { recursive: true });
       }
 
-      // Download model if requested
+      // Download model if requested. #3376: record what actually happened
+      // instead of assuming the download ran — `getEmbeddings()` returns null
+      // whenever the optional @claude-flow/embeddings package is absent, which
+      // is every plain `npm i -g ruflo` install.
+      let modelDownloaded = false;
+      let modelSkipReason: string | null = null;
+
       if (download) {
         spinner.setText(`Downloading ONNX model: ${model}...`);
         const embeddings = await getEmbeddings();
@@ -753,11 +791,16 @@ const initCommand: Command = {
           await embeddings.downloadEmbeddingModel(model, modelDir, (p) => {
             spinner.setText(`Downloading ${model}... ${p.percent.toFixed(0)}%`);
           });
+          modelDownloaded = true;
         } else {
-          // Embeddings package not available — skip download
-          await new Promise(r => setTimeout(r, 500));
-          output.writeln(output.dim('  (Skipped — @claude-flow/embeddings not installed)'));
+          // No download happened. That is the outcome of this command, not an
+          // aside — reported below via spinner.fail + a warning, never as a
+          // dimmed note on a success path. No fake progress delay: there is
+          // nothing in progress.
+          modelSkipReason = '@claude-flow/embeddings is not installed';
         }
+      } else {
+        modelSkipReason = 'download disabled by --no-download';
       }
 
       // Write embeddings config
@@ -768,6 +811,12 @@ const initCommand: Command = {
         modelPath: modelDir,
         dimension,
         cacheSize,
+        // #3376: additive, optional fields. `modelPath` keeps its old meaning
+        // (the directory the model belongs in), but it no longer implies a
+        // model is in it — `modelDownloaded` says whether one is. Readers that
+        // predate these keys are unaffected; they ignore unknown properties.
+        modelDownloaded,
+        ...(modelSkipReason ? { modelSkipReason } : {}),
         hyperbolic: {
           enabled: hyperbolic,
           curvature,
@@ -784,7 +833,15 @@ const initCommand: Command = {
 
       fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 
-      spinner.succeed('Embedding subsystem initialized');
+      // A download that was asked for and did not happen is a failed init:
+      // the only substantive step of `embeddings init` did not run. #3376.
+      const downloadSkipped = download && !modelDownloaded;
+
+      if (downloadSkipped) {
+        spinner.fail('Embedding model NOT downloaded — embedding subsystem is not ready');
+      } else {
+        spinner.succeed('Embedding subsystem initialized');
+      }
 
       output.writeln();
       output.printTable({
@@ -794,6 +851,7 @@ const initCommand: Command = {
         ],
         data: [
           { setting: 'Model', value: model },
+          { setting: 'Model Status', value: modelDownloaded ? output.success('Downloaded') : output.error('NOT downloaded') },
           { setting: 'Dimension', value: String(dimension) },
           { setting: 'Cache Size', value: String(cacheSize) + ' entries' },
           { setting: 'Hyperbolic', value: hyperbolic ? `${output.success('Enabled')} (c=${curvature})` : output.dim('Disabled') },
@@ -802,6 +860,21 @@ const initCommand: Command = {
           { setting: 'Config', value: configPath },
         ],
       });
+
+      if (downloadSkipped) {
+        output.writeln();
+        output.printWarning(`No embedding model was installed: ${modelSkipReason}.`);
+        output.printWarning('Until a real embedder is present, embeddings fall back to hash vectors, which carry no semantic meaning.');
+        output.printInfo(`Configuration was still written to ${configPath}, recording "modelDownloaded": false.`);
+        output.writeln();
+        output.writeln(output.dim('To finish initializing:'));
+        output.printList([
+          'npm install @claude-flow/embeddings   - the package this command downloads with; then: embeddings init --force',
+          'npm install ruvector                  - the other real embedder ruflo accepts; needs no download step',
+          'embeddings init --no-download --force - keep this configuration without a model (exits 0)',
+        ]);
+        return { success: false, exitCode: 1, data: config };
+      }
 
       output.writeln();
       if (hyperbolic) {
@@ -1110,7 +1183,12 @@ const neuralCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const feature = ctx.flags.feature as string || 'all';
     const init = ctx.flags.init as boolean;
-    const driftThreshold = parseFloat((ctx.flags['drift-threshold'] || ctx.flags.driftThreshold || '0.3') as string);
+    // #2790 fix — same `0 || fallback` bug: `--drift-threshold 0` was
+    // silently replaced by 0.3. Use nullish coalescing.
+    const rawDriftThreshold = ctx.flags['drift-threshold'] ?? ctx.flags.driftThreshold;
+    const driftThreshold = rawDriftThreshold === undefined || rawDriftThreshold === null
+      ? 0.3
+      : parseFloat(String(rawDriftThreshold));
     const decayRate = parseFloat((ctx.flags['decay-rate'] || ctx.flags.decayRate || '0.01') as string);
     const consolidationInterval = parseInt((ctx.flags['consolidation-interval'] || ctx.flags.consolidationInterval || '60000') as string, 10);
 
@@ -1285,8 +1363,11 @@ const modelsCommand: Command = {
           return { success: false, exitCode: 1 };
         }
       } else {
-        await new Promise(r => setTimeout(r, 500));
-        spinner.succeed(`Download skipped — @claude-flow/embeddings not installed`);
+        // #3376, same class as `init`: nothing was downloaded, so this is a
+        // failure, not a success with a caveat. No fake progress delay either.
+        spinner.fail(`Download skipped — @claude-flow/embeddings is not installed`);
+        output.printWarning(`"${download}" was not downloaded. Install @claude-flow/embeddings to enable model downloads.`);
+        return { success: false, exitCode: 1 };
       }
       return { success: true };
     }

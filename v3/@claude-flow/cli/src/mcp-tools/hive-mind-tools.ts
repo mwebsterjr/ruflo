@@ -6,6 +6,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { type MCPTool, getProjectCwd } from './types.js';
 import { validateIdentifier, validateText } from './validate-input.js';
 
@@ -14,14 +15,30 @@ const STORAGE_DIR = '.claude-flow';
 const HIVE_DIR = 'hive-mind';
 const HIVE_FILE = 'state.json';
 
+// ADR-093 F3: persist the consensus *strategy* alongside the existing
+// `consensus` field (which holds protocol pending/history). #1700 item 4
+// reported that init params for consensus didn't round-trip — they didn't,
+// because the schema lacked the parameter and the state had nowhere to
+// keep it. consensusStrategy fixes both.
+type ConsensusStrategyName = 'raft' | 'byzantine' | 'gossip' | 'crdt' | 'quorum';
+
 interface HiveState {
   initialized: boolean;
   topology: 'mesh' | 'hierarchical' | 'ring' | 'star';
+  consensusStrategy?: ConsensusStrategyName;
   queen?: {
     agentId: string;
     electedAt: string;
     term: number;
   };
+  // Capability token minted by hive-mind_init. join/leave/vote all require
+  // it (see requireHiveToken below) -- previously these mutated state.workers
+  // and proposal.votes for any caller, with nothing standing between an
+  // unauthenticated MCP caller and the hive's membership/consensus state.
+  // Undefined means no token was ever minted (state predates this field, or
+  // the hive was never initialized): fail-closed, not fail-open -- no token
+  // means no caller is authorized, not "any caller is".
+  hiveToken?: string;
   workers: string[];
   consensus: {
     pending: ConsensusProposal[];
@@ -151,6 +168,38 @@ function tryResolveProposal(
   return null;
 }
 
+/**
+ * Verify a caller-supplied hiveToken against the one minted by hive-mind_init,
+ * using a constant-time comparison (bearer-token capability check -- callers
+ * that never joined, and callers that guess/omit the token, get identical
+ * rejection). Returns an error string on failure, or null on success.
+ */
+function requireHiveToken(state: HiveState, suppliedToken: unknown): string | null {
+  if (!state.hiveToken) {
+    return 'Hive-mind has no capability token minted (re-run hive-mind_init)';
+  }
+  if (typeof suppliedToken !== 'string' || !suppliedToken) {
+    return 'hiveToken is required';
+  }
+  const expected = Buffer.from(state.hiveToken, 'utf-8');
+  const actual = Buffer.from(suppliedToken, 'utf-8');
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    return 'Invalid hiveToken';
+  }
+  return null;
+}
+
+/**
+ * Read the current hiveToken directly off disk, for same-machine callers
+ * that already have filesystem access to hive state (the CLI's own
+ * `hive-mind join/leave/consensus` subcommands) -- NOT exposed over any MCP
+ * tool response (in particular, not hive-mind_status), since that's a
+ * remote-reachable surface a capability token must not leak through.
+ */
+export function getHiveTokenForCli(): string | undefined {
+  return loadHiveState().hiveToken;
+}
+
 function getHiveDir(): string {
   return join(getProjectCwd(), STORAGE_DIR, HIVE_DIR);
 }
@@ -217,7 +266,7 @@ function saveAgentStore(store: { agents: Record<string, unknown> }): void {
 export const hiveMindTools: MCPTool[] = [
   {
     name: 'hive-mind_spawn',
-    description: 'Spawn workers and automatically join them to the hive-mind (combines agent/spawn + hive-mind/join)',
+    description: 'Spawn workers and automatically join them to the hive-mind (combines agent/spawn + hive-mind/join) Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
@@ -288,12 +337,20 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_init',
-    description: 'Initialize the hive-mind collective',
+    description: 'Initialize the hive-mind collective Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
       properties: {
         topology: { type: 'string', enum: ['mesh', 'hierarchical', 'ring', 'star'], description: 'Network topology' },
+        // ADR-093 F3: schema now exposes the consensus strategy so callers
+        // can actually request raft / byzantine / quorum / etc. Default
+        // matches the documented anti-drift posture (raft).
+        consensus: {
+          type: 'string',
+          enum: ['raft', 'byzantine', 'gossip', 'crdt', 'quorum'],
+          description: 'Consensus strategy. Default: raft (anti-drift). Use byzantine for f<n/3 fault tolerance.',
+        },
         queenId: { type: 'string', description: 'Initial queen agent ID' },
       },
     },
@@ -304,14 +361,24 @@ export const hiveMindTools: MCPTool[] = [
       const hiveId = `hive-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const queenId = (input.queenId as string) || `queen-${Date.now()}`;
 
+      const requestedConsensus = (input.consensus as ConsensusStrategyName) || 'raft';
       state.initialized = true;
       state.topology = (input.topology as HiveState['topology']) || 'mesh';
+      state.consensusStrategy = requestedConsensus;
       state.createdAt = new Date().toISOString();
       state.queen = {
         agentId: queenId,
         electedAt: new Date().toISOString(),
         term: 1,
       };
+      // Mint a capability token on first init; a re-init (topology/consensus
+      // change on an already-initialized hive) keeps the existing token and
+      // roster rather than silently invalidating workers who already hold
+      // it -- only re-generated if somehow absent (e.g. state predates this
+      // field).
+      if (!state.hiveToken) {
+        state.hiveToken = randomBytes(32).toString('hex');
+      }
 
       saveHiveState(state);
 
@@ -319,12 +386,13 @@ export const hiveMindTools: MCPTool[] = [
         success: true,
         hiveId,
         topology: state.topology,
-        consensus: (input.consensus as string) || 'byzantine',
+        consensus: state.consensusStrategy,
         queenId,
         status: 'initialized',
+        hiveToken: state.hiveToken,
         config: {
           topology: state.topology,
-          consensus: input.consensus || 'byzantine',
+          consensus: state.consensusStrategy,
           maxAgents: input.maxAgents || 15,
           persist: input.persist !== false,
           memoryBackend: input.memoryBackend || 'hybrid',
@@ -335,7 +403,7 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_status',
-    description: 'Get hive-mind status',
+    description: 'Get hive-mind status Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
@@ -375,7 +443,8 @@ export const hiveMindTools: MCPTool[] = [
         hiveId: `hive-${state.createdAt ? new Date(state.createdAt).getTime() : Date.now()}`,
         status: state.initialized ? 'active' : 'offline',
         topology: state.topology,
-        consensus: 'byzantine', // Default consensus type
+        // ADR-093 F3: surface the persisted strategy instead of a hardcoded "byzantine".
+        consensus: state.consensusStrategy ?? 'byzantine',
         queen: state.queen ? {
           id: state.queen.agentId,
           agentId: state.queen.agentId,
@@ -436,15 +505,16 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_join',
-    description: 'Join an agent to the hive-mind',
+    description: 'Join an agent to the hive-mind Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
       properties: {
         agentId: { type: 'string', description: 'Agent ID to join' },
         role: { type: 'string', enum: ['worker', 'specialist', 'scout'], description: 'Agent role in hive' },
+        hiveToken: { type: 'string', description: 'Capability token minted by hive-mind_init' },
       },
-      required: ['agentId'],
+      required: ['agentId', 'hiveToken'],
     },
     handler: async (input) => {
       const state = loadHiveState();
@@ -454,6 +524,14 @@ export const hiveMindTools: MCPTool[] = [
 
       if (!state.initialized) {
         return { success: false, error: 'Hive-mind not initialized' };
+      }
+
+      // Fail-closed: an unrecognized/missing token makes no membership
+      // change at all -- state.workers is untouched, not just left
+      // unsaved (the write below never happens on this path).
+      const tokenError = requireHiveToken(state, input.hiveToken);
+      if (tokenError) {
+        return { success: false, agentId, error: tokenError };
       }
 
       if (!state.workers.includes(agentId)) {
@@ -472,20 +550,28 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_leave',
-    description: 'Remove an agent from the hive-mind',
+    description: 'Remove an agent from the hive-mind Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
       properties: {
         agentId: { type: 'string', description: 'Agent ID to remove' },
+        hiveToken: { type: 'string', description: 'Capability token minted by hive-mind_init' },
       },
-      required: ['agentId'],
+      required: ['agentId', 'hiveToken'],
     },
     handler: async (input) => {
       const state = loadHiveState();
       const agentId = input.agentId as string;
 
       { const v = validateIdentifier(agentId, 'agentId'); if (!v.valid) return { success: false, agentId, error: v.error }; }
+
+      // Fail-closed: a denied caller makes no membership change -- the
+      // splice/save below is unreachable on this path.
+      const tokenError = requireHiveToken(state, input.hiveToken);
+      if (tokenError) {
+        return { success: false, agentId, error: tokenError };
+      }
 
       const index = state.workers.indexOf(agentId);
       if (index > -1) {
@@ -504,7 +590,7 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_consensus',
-    description: 'Propose or vote on consensus with BFT, Raft, or Quorum strategies',
+    description: 'Propose or vote on consensus with BFT, Raft, or Quorum strategies Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
@@ -515,6 +601,7 @@ export const hiveMindTools: MCPTool[] = [
         value: { description: 'Proposal value (for propose)' },
         vote: { type: 'boolean', description: 'Vote (true=for, false=against)' },
         voterId: { type: 'string', description: 'Voter agent ID' },
+        hiveToken: { type: 'string', description: 'Capability token minted by hive-mind_init (required to vote)' },
         strategy: { type: 'string', enum: ['bft', 'raft', 'quorum'], description: 'Consensus strategy (default: raft)' },
         quorumPreset: { type: 'string', enum: ['unanimous', 'majority', 'supermajority'], description: 'Quorum threshold preset (for quorum strategy, default: majority)' },
         term: { type: 'number', description: 'Term number (for raft strategy)' },
@@ -596,6 +683,30 @@ export const hiveMindTools: MCPTool[] = [
         const voterId = input.voterId as string;
         if (!voterId) {
           return { action, error: 'voterId is required for voting' };
+        }
+
+        // Fail-closed: a denied caller records no vote at all -- the
+        // votes[voterId] write below is unreachable on this path, and
+        // nothing about the proposal (vote tallies, status) changes.
+        const tokenError = requireHiveToken(state, input.hiveToken);
+        if (tokenError) {
+          return { action, error: tokenError, proposalId: proposal.proposalId };
+        }
+
+        // voterId was previously trusted as-is: any caller-supplied string
+        // was recorded into proposal.votes and counted toward
+        // calculateRequiredVotes()'s threshold (derived from
+        // state.workers.length), with no check that it named a worker who
+        // actually joined this hive-mind. That let a single caller cross
+        // any strategy's quorum (raft/bft/quorum alike) by voting under
+        // fabricated ids — a Sybil attack on consensus, not merely a
+        // double-vote. Require the voter to be a registered worker.
+        if (!state.workers.includes(voterId)) {
+          return {
+            action,
+            error: `Voter ${voterId} is not a registered hive-mind worker`,
+            proposalId: proposal.proposalId,
+          };
         }
 
         const voteValue = input.vote as boolean;
@@ -822,7 +933,7 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_broadcast',
-    description: 'Broadcast message to all workers',
+    description: 'Broadcast message to all workers Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
@@ -870,7 +981,7 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_shutdown',
-    description: 'Shutdown the hive-mind and terminate all workers',
+    description: 'Shutdown the hive-mind and terminate all workers Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
@@ -935,7 +1046,7 @@ export const hiveMindTools: MCPTool[] = [
   },
   {
     name: 'hive-mind_memory',
-    description: 'Access hive shared memory',
+    description: 'Access hive shared memory Use when native Task is wrong because you need queen-led collective intelligence — Byzantine-FT consensus, broadcast across many worker agents, shared memory with bounded conflict. For a single subagent, native Task is fine. Pair with swarm_init first to set topology.',
     category: 'hive-mind',
     inputSchema: {
       type: 'object',
@@ -1007,6 +1118,48 @@ export const hiveMindTools: MCPTool[] = [
       }
 
       return { action, error: 'Unknown action' };
+    },
+  },
+  {
+    // #1916: `ruflo hive-mind optimize-memory` referenced an unregistered
+    // `hive-mind_optimize-memory` tool. Best-effort today: prunes obviously-
+    // empty shared-memory keys and reports the before/after counts; pattern
+    // quality consolidation is a follow-up (it belongs in the intelligence
+    // pipeline / agentdb curator, not here).
+    name: 'hive-mind_optimize-memory',
+    description: 'Compact the hive-mind shared-memory store (drops null/empty keys) and report before/after pattern counts. Use when native conversation memory is wrong because you need the queen-led collective\'s persisted shared state cleaned up between phases. For one-shot scratch state, no tool needed. (Pattern-quality consolidation is delegated to the intelligence pipeline — this only does the cheap structural pass for now.)',
+    category: 'hive-mind',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        qualityThreshold: { type: 'number', description: 'Quality threshold for pattern retention (advisory — not enforced yet)' },
+      },
+    },
+    handler: async () => {
+      const t0 = Date.now();
+      const state = loadHiveState();
+      if (!state.initialized) return { optimized: false, error: 'Hive-mind not initialized', before: { patterns: 0, memory: '0' }, after: { patterns: 0, memory: '0' }, removed: 0, consolidated: 0, timeMs: 0 };
+      const beforeKeys = Object.keys(state.sharedMemory);
+      const before = beforeKeys.length;
+      for (const k of beforeKeys) {
+        const v = state.sharedMemory[k];
+        if (v === null || v === undefined || (typeof v === 'object' && v !== null && Object.keys(v as object).length === 0)) {
+          delete state.sharedMemory[k];
+        }
+      }
+      const after = Object.keys(state.sharedMemory).length;
+      const removed = before - after;
+      if (removed > 0) saveHiveState(state);
+      const sizeStr = (n: number) => `${Buffer.byteLength(JSON.stringify(state.sharedMemory))}B (~${n} keys)`;
+      return {
+        optimized: removed > 0,
+        before: { patterns: before, memory: `~${before} keys` },
+        after: { patterns: after, memory: sizeStr(after) },
+        removed,
+        consolidated: 0,
+        timeMs: Date.now() - t0,
+        note: 'structural compaction only; pattern-quality consolidation is delegated to the intelligence pipeline (#1916 follow-up)',
+      };
     },
   },
 ];

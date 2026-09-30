@@ -4,6 +4,7 @@
  */
 
 import { EventEmitter } from 'events';
+import type { ConsensusTransport, ConsensusMessage } from './transport.js';
 import {
   ConsensusProposal,
   ConsensusVote,
@@ -76,6 +77,14 @@ export interface GossipConfig extends Partial<ConsensusConfig> {
   gossipIntervalMs?: number;
   maxHops?: number;
   convergenceThreshold?: number;
+  /**
+   * ADR-095 G2 — optional pluggable transport. When set, gossip messages
+   * to neighbors actually go over it (signed if the transport has a
+   * keypair) and inbound gossip is routed back into the merge logic.
+   * When unset, behavior is unchanged: the legacy in-process path mutates
+   * the local `nodes` map directly (single-process).
+   */
+  transport?: ConsensusTransport;
 }
 
 export class GossipConsensus extends EventEmitter {
@@ -86,6 +95,7 @@ export class GossipConsensus extends EventEmitter {
   private messageQueue: GossipMessage[] = [];
   private gossipInterval?: NodeJS.Timeout;
   private proposalCounter: number = 0;
+  private readonly transport?: ConsensusTransport;
 
   constructor(nodeId: string, config: GossipConfig = {}) {
     super();
@@ -98,7 +108,9 @@ export class GossipConsensus extends EventEmitter {
       gossipIntervalMs: config.gossipIntervalMs ?? 100,
       maxHops: config.maxHops ?? 10,
       convergenceThreshold: config.convergenceThreshold ?? 0.9,
+      transport: config.transport,
     };
+    this.transport = config.transport;
 
     this.node = {
       id: nodeId,
@@ -108,6 +120,34 @@ export class GossipConsensus extends EventEmitter {
       seenMessages: new BoundedSet(100_000), // PERF-01: ~4MB cap (100K × ~40B IDs)
       lastSync: new Date(),
     };
+
+    if (this.transport) {
+      this.transport.onMessage(async (msg: ConsensusMessage) => this.handleInboundGossipMessage(msg));
+    }
+  }
+
+  /**
+   * ADR-095 G2 — route an inbound transport message into the gossip merge
+   * logic. The transport handles signature verification (if enabled). We
+   * dedupe by message id (the BoundedSet `seenMessages`) and process it as
+   * though it arrived from a neighbor.
+   */
+  private async handleInboundGossipMessage(msg: ConsensusMessage): Promise<void> {
+    if (msg.type !== 'gossip') return;
+    const gm = msg.payload as GossipMessage | undefined;
+    if (!gm || typeof gm.id !== 'string') return;
+    if (this.node.seenMessages.has(gm.id)) return;
+    // Ensure the sender is known as a neighbor so processReceivedMessage works.
+    if (!this.nodes.has(msg.from)) {
+      this.nodes.set(msg.from, { id: msg.from, state: new Map(), version: 0, neighbors: new Set(), seenMessages: new BoundedSet(100_000), lastSync: new Date() });
+    }
+    this.node.neighbors.add(msg.from);
+    // Process against THIS node's state (the message reached us).
+    await this.processReceivedMessage(this.node, {
+      ...gm,
+      timestamp: gm.timestamp ? new Date(gm.timestamp as unknown as string) : new Date(),
+      path: Array.isArray(gm.path) ? gm.path : [],
+    });
   }
 
   async initialize(): Promise<void> {
@@ -158,7 +198,10 @@ export class GossipConsensus extends EventEmitter {
     this.node.neighbors.delete(nodeId);
   }
 
-  async propose(value: unknown): Promise<ConsensusProposal> {
+  async propose(
+    value: unknown,
+    weights?: Map<string, number>
+  ): Promise<ConsensusProposal> {
     this.proposalCounter++;
     const proposalId = `gossip_${this.node.id}_${this.proposalCounter}`;
 
@@ -170,6 +213,7 @@ export class GossipConsensus extends EventEmitter {
       timestamp: new Date(),
       votes: new Map(),
       status: 'pending',
+      weights,
     };
 
     this.proposals.set(proposalId, proposal);
@@ -314,26 +358,34 @@ export class GossipConsensus extends EventEmitter {
   }
 
   private async sendToNeighbor(neighborId: string, message: GossipMessage): Promise<void> {
-    const neighbor = this.nodes.get(neighborId);
-    if (!neighbor) {
-      return;
-    }
-
-    // Check if already seen
-    if (neighbor.seenMessages.has(message.id)) {
-      return;
-    }
-
-    // Deliver message to neighbor node
     const deliveredMessage: GossipMessage = {
       ...message,
       hops: message.hops + 1,
       path: [...message.path, neighborId],
     };
 
-    // Process at neighbor
-    await this.processReceivedMessage(neighbor, deliveredMessage);
+    // ADR-095 G2 — over the transport when wired: actually send the gossip
+    // message to the neighbor (signed by the transport if signing is on).
+    // The emit stays for observability.
+    if (this.transport) {
+      this.emit('message.sent', { to: neighborId, message: deliveredMessage });
+      try {
+        await this.transport.send(neighborId, {
+          type: 'gossip',
+          payload: { ...deliveredMessage, timestamp: deliveredMessage.timestamp.toISOString() },
+        });
+      } catch {
+        // Unreachable neighbor — gossip tolerates this; it'll converge via
+        // other paths or the next gossip round.
+      }
+      return;
+    }
 
+    // Legacy in-process path — deliver to the fake neighbor state.
+    const neighbor = this.nodes.get(neighborId);
+    if (!neighbor) return;
+    if (neighbor.seenMessages.has(message.id)) return;
+    await this.processReceivedMessage(neighbor, deliveredMessage);
     this.emit('message.sent', { to: neighborId, message: deliveredMessage });
   }
 
@@ -448,6 +500,16 @@ export class GossipConsensus extends EventEmitter {
     }
   }
 
+  // Dream Cycle 2026-08-24 (swarm): per-voter weight for weighted consensus,
+  // clamped to [0,1] (same safety rationale as byzantine.ts's f-faulty-node
+  // quorum — a vote can never count for more than one unweighted vote).
+  // Missing weights/voter defaults to 1 (flat vote), reproducing today's
+  // behavior exactly when no weights map is supplied.
+  private voteWeight(proposal: ConsensusProposal, voterId: string): number {
+    const w = proposal.weights?.get(voterId) ?? 1;
+    return Math.max(0, Math.min(1, w));
+  }
+
   private async checkConvergence(proposalId: string): Promise<void> {
     const proposal = this.proposals.get(proposalId);
     if (!proposal || proposal.status !== 'pending') {
@@ -459,13 +521,21 @@ export class GossipConsensus extends EventEmitter {
     const threshold = this.config.convergenceThreshold ?? 0.9;
     const approvalThreshold = this.config.threshold ?? 0.66;
 
-    // Check if we've converged (enough nodes have voted)
+    // Check if we've converged (enough nodes have voted) — participation is
+    // a network-topology property (has everyone been heard from), so it
+    // stays an unweighted vote count; only the approve/reject decision below
+    // uses weighted approval share.
     if (votes / totalNodes >= threshold) {
-      const approvingVotes = Array.from(proposal.votes.values()).filter(
-        v => v.approve
-      ).length;
+      const castVotes = Array.from(proposal.votes.values());
+      const approvingWeight = castVotes
+        .filter(v => v.approve)
+        .reduce((sum, v) => sum + this.voteWeight(proposal, v.voterId), 0);
+      const totalCastWeight = castVotes.reduce(
+        (sum, v) => sum + this.voteWeight(proposal, v.voterId),
+        0
+      );
 
-      if (approvingVotes / votes >= approvalThreshold) {
+      if (totalCastWeight > 0 && approvingWeight / totalCastWeight >= approvalThreshold) {
         proposal.status = 'accepted';
         this.emit('consensus.achieved', { proposalId, approved: true });
       } else {
@@ -477,16 +547,19 @@ export class GossipConsensus extends EventEmitter {
 
   private createResult(proposal: ConsensusProposal, durationMs: number): ConsensusResult {
     const totalNodes = this.nodes.size + 1;
-    const approvingVotes = Array.from(proposal.votes.values()).filter(
-      v => v.approve
-    ).length;
+    const castVotes = Array.from(proposal.votes.values());
+    const approvingWeight = castVotes
+      .filter(v => v.approve)
+      .reduce((sum, v) => sum + this.voteWeight(proposal, v.voterId), 0);
+    const totalCastWeight = castVotes.reduce(
+      (sum, v) => sum + this.voteWeight(proposal, v.voterId),
+      0
+    );
 
     return {
       proposalId: proposal.id,
       approved: proposal.status === 'accepted',
-      approvalRate: proposal.votes.size > 0
-        ? approvingVotes / proposal.votes.size
-        : 0,
+      approvalRate: totalCastWeight > 0 ? approvingWeight / totalCastWeight : 0,
       participationRate: proposal.votes.size / totalNodes,
       finalValue: proposal.value,
       rounds: this.node.version,

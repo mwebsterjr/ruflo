@@ -177,7 +177,7 @@ const createCommand: Command = {
         type: taskType,
         description,
         priority: priority || 'normal',
-        assignedTo: ctx.flags.assign ? [ctx.flags.assign] : undefined,
+        assignTo: ctx.flags.assign ? String(ctx.flags.assign).split(',').map(id => id.trim()).filter(Boolean) : undefined,
         parentId: ctx.flags.parent,
         dependencies,
         tags,
@@ -204,7 +204,7 @@ const createCommand: Command = {
           { property: 'Priority', value: formatPriority(result.priority) },
           { property: 'Status', value: formatStatus(result.status) },
           { property: 'Assigned To', value: result.assignedTo?.join(', ') || 'Unassigned' },
-          { property: 'Tags', value: result.tags.join(', ') || 'None' },
+          { property: 'Tags', value: result.tags?.join(', ') || 'None' }, // #1863 — guard undefined array
           { property: 'Created', value: new Date(result.createdAt).toLocaleString() }
         ]
       });
@@ -271,13 +271,14 @@ const listCommand: Command = {
     }
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
-    const status = ctx.flags.all ? 'all' : (ctx.flags.status as string) || 'pending,running';
+    const requestedStatus = ctx.flags.all ? 'all' : (ctx.flags.status as string) || 'pending,in_progress';
+    const status = requestedStatus === 'all' ? undefined : requestedStatus.replace(/\brunning\b/g, 'in_progress');
     const limit = ctx.flags.limit as number;
 
     try {
       const result = await callMCPTool<{
         tasks: Array<{
-          id: string;
+          taskId: string;
           type: string;
           description: string;
           priority: string;
@@ -291,7 +292,7 @@ const listCommand: Command = {
         status,
         type: ctx.flags.type,
         priority: ctx.flags.priority,
-        agentId: ctx.flags.agent,
+        assignedTo: ctx.flags.agent,
         limit,
         offset: 0
       });
@@ -320,7 +321,7 @@ const listCommand: Command = {
           { key: 'progress', header: 'Progress', width: 10 }
         ],
         data: result.tasks.map(t => ({
-          id: t.id,
+          id: t.taskId,
           type: t.type,
           description: t.description.length > 27
             ? t.description.slice(0, 27) + '...'
@@ -436,11 +437,15 @@ const statusCommand: Command = {
           { key: 'value', header: 'Value', width: 40 }
         ],
         data: [
+          // #1863 — tasks created via task_create or loaded from an older
+          // store schema may not have these arrays populated; guard each
+          // `.join()` so `task status` never throws "Cannot read properties
+          // of undefined (reading 'join')".
           { property: 'Assigned To', value: result.assignedTo?.join(', ') || 'Unassigned' },
           { property: 'Parent Task', value: result.parentId || 'None' },
-          { property: 'Dependencies', value: result.dependencies.join(', ') || 'None' },
-          { property: 'Dependents', value: result.dependents.join(', ') || 'None' },
-          { property: 'Tags', value: result.tags.join(', ') || 'None' }
+          { property: 'Dependencies', value: result.dependencies?.join(', ') || 'None' },
+          { property: 'Dependents', value: result.dependents?.join(', ') || 'None' },
+          { property: 'Tags', value: result.tags?.join(', ') || 'None' }
         ]
       });
 

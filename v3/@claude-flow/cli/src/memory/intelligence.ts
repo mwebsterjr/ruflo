@@ -13,7 +13,9 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { resolveTrainingBackend } from '../ruvector/lora-adapter.js';
 
 // ============================================================================
 // Persistence Configuration
@@ -358,10 +360,20 @@ class LocalSonaCoordinator {
 
           // Check EWC penalty before applying update
           if (ewcConsolidator) {
-            const oldWeights = [oldConfidence];
             const proposedConfidence = Math.min(1.0, oldConfidence + this.config.loraLearningRate * reward);
-            const newWeights = [proposedConfidence];
-            const penalty = ewcConsolidator.getPenalty(oldWeights, newWeights);
+            // Use computeConfidencePenalty (averages the full Fisher diagonal),
+            // not getPenalty([oldConf],[newConf]) — that call shape collapses
+            // to fisherDiag[0] only (Math.min(1,1,384) === 1), an arbitrary
+            // single dimension instead of the full accumulated Fisher signal.
+            // computeConfidencePenalty exists precisely for this
+            // scalar-confidence case (see its docstring) but was unwired.
+            // Note: neither call shape differentiates between patterns — both
+            // take only a confidence delta, not a per-pattern embedding, so
+            // two patterns with the same delta under the same consolidator
+            // state get the same penalty either way. This fix corrects which
+            // shared Fisher signal informs that penalty; it does not add
+            // per-pattern discrimination (see ewc-distill-confidence-gate.test.ts).
+            const penalty = ewcConsolidator.computeConfidencePenalty(oldConfidence, proposedConfidence);
             totalEwcPenalty += penalty;
 
             // If penalty is too high, reduce the update magnitude
@@ -391,15 +403,14 @@ class LocalSonaCoordinator {
       }
     }
 
-    // Update EWC Fisher matrix with confidence changes
+    // Update EWC Fisher matrix with confidence changes. updateFisherFromConfidences
+    // takes the full per-pattern embedding + confidence-delta batch directly (it
+    // computes the same squared confidence-delta-scaled-embedding gradient proxy
+    // internally) — replaces the previous per-change recordGradient loop, which
+    // updated the full 384-dim globalFisher but fed a signal that getPenalty's
+    // 1-element call shape then read back only at index 0.
     if (ewcConsolidator && confidenceChanges.length > 0) {
-      for (const change of confidenceChanges) {
-        // Use confidence delta as gradient proxy
-        const gradient = change.embedding.map(
-          e => e * Math.abs(change.newConf - change.oldConf)
-        );
-        ewcConsolidator.recordGradient(change.id, gradient, true);
-      }
+      ewcConsolidator.updateFisherFromConfidences(confidenceChanges);
     }
 
     // Persist updated patterns
@@ -600,12 +611,22 @@ class LocalReasoningBank {
   }
 
   /**
-   * Find similar patterns by embedding
+   * Find similar patterns by embedding.
+   *
+   * `confidence` on each result is the pattern's own learned reliability
+   * (unchanged from storage) — NOT how well it matches this query. The
+   * per-query cosine score is returned separately as `similarity`. Callers
+   * that want "how good a semantic match is this" must read `.similarity`;
+   * callers that want "how reliable has this pattern proven to be" read
+   * `.confidence`. Prior to this fix both were conflated (confidence was
+   * overwritten with the cosine score), which silently broke any consumer
+   * that needed to tell them apart (found during the 2026-09-12 dream-cycle
+   * intelligence-surface review).
    */
   findSimilar(
     queryEmbedding: number[],
     options: { k?: number; threshold?: number; type?: string }
-  ): StoredPattern[] {
+  ): (StoredPattern & { similarity: number })[] {
     const { k = 5, threshold = 0.5, type } = options;
 
     // Filter by type if specified
@@ -628,7 +649,7 @@ class LocalReasoningBank {
         // Update usage
         s.pattern.usageCount++;
         s.pattern.lastUsedAt = Date.now();
-        return { ...s.pattern, confidence: s.score };
+        return { ...s.pattern, similarity: s.score };
       });
   }
 
@@ -717,18 +738,35 @@ class LocalReasoningBank {
 let ruvllmCoordinator: any = null;
 let ruvllmLoaded = false;
 
-async function loadRuvllmCoordinator(): Promise<any> {
+/**
+ * Synchronously load the @ruvector/ruvllm SonaCoordinator. Used both by the
+ * async init path (initializeIntelligence) and by sync stat readers like
+ * getIntelligenceStats — the dashboard would otherwise report "unavailable"
+ * when stats are queried before any async init has fired (#1770).
+ */
+function loadRuvllmCoordinatorSync(): any {
   if (ruvllmLoaded) return ruvllmCoordinator;
   ruvllmLoaded = true;
   try {
-    const { createRequire } = await import('module');
     const requireCjs = createRequire(import.meta.url);
     const ruvllm = requireCjs('@ruvector/ruvllm');
     ruvllmCoordinator = new ruvllm.SonaCoordinator(ruvllm.DEFAULT_SONA_CONFIG);
     return ruvllmCoordinator;
-  } catch {
+  } catch (err) {
+    // Surface the reason on debug builds so future regressions of #1770 don't
+    // disappear silently. Stays quiet by default to avoid noise on the cli's
+    // hot path (e.g., npx invocations).
+    if (process.env.CLAUDE_FLOW_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.error('[ruvllm] SonaCoordinator load failed, falling back to JS:', (err as Error).message);
+    }
+    ruvllmCoordinator = null;
     return null;
   }
+}
+
+async function loadRuvllmCoordinator(): Promise<any> {
+  return loadRuvllmCoordinatorSync();
 }
 
 // ============================================================================
@@ -758,7 +796,12 @@ function loadPersistedStats(): void {
     if (existsSync(path)) {
       const data = JSON.parse(readFileSync(path, 'utf-8'));
       if (data && typeof data === 'object') {
+        // #2245: previously only restored trajectoriesRecorded — patternsLearned
+        // and signalsProcessed reset to zero on every restart, masking real
+        // learning progress in the dashboards.
         globalStats.trajectoriesRecorded = data.trajectoriesRecorded ?? 0;
+        globalStats.patternsLearned = data.patternsLearned ?? 0;
+        globalStats.signalsProcessed = data.signalsProcessed ?? 0;
         globalStats.lastAdaptation = data.lastAdaptation ?? null;
       }
     }
@@ -778,6 +821,167 @@ function savePersistedStats(): void {
   } catch {
     // Ignore save errors
   }
+}
+
+/**
+ * Record a memory-bridge / hook write so `signalsProcessed` reflects real
+ * activity instead of being a permanently-zero dead metric (#2245). Throttled
+ * persistence: increments are batched (every Nth save) to avoid hitting disk
+ * on every single bridge call.
+ *
+ * Returns the new count.
+ */
+let signalsSinceLastSave = 0;
+const SIGNAL_PERSIST_EVERY = 16;
+export function recordSignalProcessed(): number {
+  globalStats.signalsProcessed = (globalStats.signalsProcessed ?? 0) + 1;
+  signalsSinceLastSave++;
+  if (signalsSinceLastSave >= SIGNAL_PERSIST_EVERY) {
+    savePersistedStats();
+    signalsSinceLastSave = 0;
+  }
+  return globalStats.signalsProcessed;
+}
+
+/** Force-persist current stats (e.g. before shutdown / for tests). */
+export function flushIntelligenceStats(): void {
+  savePersistedStats();
+  signalsSinceLastSave = 0;
+}
+
+// ============================================================================
+// Unified learning-stats aggregator (#2245 follow-up to ADR-074)
+// ============================================================================
+
+/**
+ * The four historical stat sources (globalStats / memory_bridge_status /
+ * hooks metrics / neural_patterns count) genuinely measure different things,
+ * so we don't merge them — we expose ONE call that returns all four sub-views
+ * with the *source path* of each, plus a `consistency` block that spot-checks
+ * the relationships the system maintains.
+ *
+ * No new store; no migration; just one honest view across the four.
+ */
+export interface UnifiedLearningStats {
+  global: {
+    patternsLearned: number;
+    trajectoriesRecorded: number;
+    signalsProcessed: number;
+    lastAdaptation: number | null;
+    source: string;
+    scope: 'project-persisted';
+  };
+  sona: {
+    trajectoriesTotal: number;
+    patternsLearned: number;
+    reasoningBankSize: number;
+    avgAdaptationTimeMs: number;
+    source: string;
+    available: boolean;
+    scope: 'process-local';
+    metric: 'recent-buffered-trajectories';
+  };
+  memoryBridge: {
+    totalEntries: number;
+    perNamespace: Record<string, number>;
+    source: string;
+    reachable: boolean;
+  };
+  neuralPatterns: {
+    patternCount: number;
+    byType: Record<string, number>;
+    modelCount: number;
+    source: string;
+  };
+  consistency: {
+    /** These counters measure different lifetimes and cannot be compared. */
+    sonaTracksGlobal: null;
+    sonaTracksGlobalDelta: null;
+    notes: string[];
+  };
+  generatedAt: string;
+}
+
+export async function getUnifiedLearningStats(): Promise<UnifiedLearningStats> {
+  const intel = getIntelligenceStats();
+  const sonaCoord = sonaCoordinator;
+  const bank = reasoningBank;
+
+  // SONA in-memory view
+  const sonaAvailable = !!sonaCoord;
+  let sonaStats = { trajectoriesTotal: 0, patternsLearned: 0, reasoningBankSize: 0, avgAdaptationTimeMs: 0 };
+  if (sonaCoord) {
+    try {
+      const s = sonaCoord.stats();
+      sonaStats = {
+        // LocalSonaCoordinator.stats() reports trajectoryCount, a bounded
+        // recent buffer. Reading nonexistent trajectoriesTotal / processed
+        // fields made this metric permanently 0, even after learning.
+        trajectoriesTotal: s.trajectoryCount,
+        patternsLearned: 0,
+        reasoningBankSize: bank?.stats().patternCount ?? 0,
+        avgAdaptationTimeMs: s.avgAdaptationMs,
+      };
+    } catch { /* SONA not yet initialised */ }
+  }
+
+  // memory-bridge
+  let bridgeStats: UnifiedLearningStats['memoryBridge'] = {
+    totalEntries: 0, perNamespace: {}, source: 'memory-bridge (skipped)', reachable: false,
+  };
+  try {
+    const mb = await import('./memory-bridge.js');
+    bridgeStats = await mb.getMemoryBridgeStats();
+  } catch { /* bridge module not loadable */ }
+
+  // neural store
+  let neuralStats: UnifiedLearningStats['neuralPatterns'] = {
+    patternCount: 0, byType: {}, modelCount: 0, source: 'neural store (skipped)',
+  };
+  try {
+    const nt = await import('../mcp-tools/neural-tools.js');
+    neuralStats = nt.getNeuralStoreStats();
+  } catch { /* neural module not loadable */ }
+
+  // SONA's coordinator is recreated on each process start, while globalStats
+  // is restored from disk. Their counts can differ by thousands after a
+  // restart even when both learning paths work correctly (#3198).
+  const notes: string[] = [];
+  if (sonaAvailable && sonaStats.trajectoriesTotal !== intel.trajectoriesRecorded) {
+    notes.push('sona.trajectoriesTotal is a process-local, bounded recent trajectory buffer; global.trajectoriesRecorded is project-persisted. These counters have different lifetimes and are not comparable.');
+  }
+  if (intel.patternsLearned > 0 && neuralStats.patternCount === 0) {
+    notes.push(`globalStats reports ${intel.patternsLearned} patterns learned but neural_patterns store is empty — pretrain has not written here, or trajectory-end isn't promoting patterns to the neural store yet`);
+  }
+  if (!bridgeStats.reachable) {
+    notes.push('memory-bridge unreachable — bridge-dependent counters (post-edit/-command persistence, pretrain bundle) will show 0');
+  }
+
+  return {
+    global: {
+      patternsLearned: intel.patternsLearned,
+      trajectoriesRecorded: intel.trajectoriesRecorded,
+      signalsProcessed: intel.signalsProcessed,
+      lastAdaptation: intel.lastAdaptation,
+      source: '.claude-flow/neural/stats.json (globalStats)',
+      scope: 'project-persisted',
+    },
+    sona: {
+      ...sonaStats,
+      source: 'sonaCoordinator (in-memory, resets per process)',
+      available: sonaAvailable,
+      scope: 'process-local',
+      metric: 'recent-buffered-trajectories',
+    },
+    memoryBridge: bridgeStats,
+    neuralPatterns: neuralStats,
+    consistency: {
+      sonaTracksGlobal: null,
+      sonaTracksGlobalDelta: null,
+      notes,
+    },
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 // ============================================================================
@@ -1059,7 +1263,7 @@ export async function findSimilarPatterns(
       usageCount: r.usageCount,
       createdAt: r.createdAt,
       lastUsedAt: r.lastUsedAt,
-      similarity: (r as unknown as { similarity?: number }).similarity ?? r.confidence ?? 0.5
+      similarity: r.similarity
     }));
   } catch {
     return [];
@@ -1078,17 +1282,37 @@ export function getIntelligenceStats(): IntelligenceStats & {
   const sonaStats = sonaCoordinator?.stats();
   const bankStats = reasoningBank?.stats();
 
+  // Lazy-init the ruvllm coordinator if it hasn't been loaded yet. The MCP
+  // dashboard (`hooks_intelligence_stats`) hits this path before any
+  // initializeIntelligence() call has fired, so the coordinator field would
+  // otherwise stay null and the dashboard would report "unavailable" even
+  // when @ruvector/ruvllm is fully resolvable. Sync require — cheap, idempotent.
+  if (!ruvllmLoaded) {
+    loadRuvllmCoordinatorSync();
+  }
   const ruvllmStats = ruvllmCoordinator?.stats?.() || null;
 
-  // Fetch cross-module stats for unified reporting
+  // Fetch cross-module stats for unified reporting.
+  //
+  // #2549 — two prior defects here: `trainingBackend` was declared and
+  // returned but never assigned (always 'unavailable'), and contrastive
+  // availability was read ONLY from an in-process global that a fresh
+  // read-only `neural status` process never populates. Both made the
+  // native @ruvector/ruvllm path invisible even when installed. Backend
+  // now comes from the lora-adapter's capability probe; the global still
+  // wins when present because it carries live in-process session counts.
   let contrastiveTrainer: { triplets: number; agents: number } | string = 'unavailable';
   let trainingBackend = 'unavailable';
   try {
-    // Synchronous check — contrastiveTrainer is module-level in sona-optimizer
-    // We read it via the SONAOptimizer singleton if available
+    trainingBackend = resolveTrainingBackend();
+  } catch { /* module absent — stay 'unavailable' */ }
+  try {
     const sonaModule = (globalThis as any).__claudeFlowSonaStats;
-    if (sonaModule) {
-      contrastiveTrainer = sonaModule._contrastiveTrainer || 'unavailable';
+    if (sonaModule?._contrastiveTrainer) {
+      contrastiveTrainer = sonaModule._contrastiveTrainer;
+    } else if (trainingBackend === 'ruvllm') {
+      // Module resolves but no in-process session — available, idle.
+      contrastiveTrainer = 'available';
     }
   } catch { /* not available */ }
 

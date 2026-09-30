@@ -8,6 +8,8 @@
  */
 
 import { EventEmitter } from 'node:events';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   IMemoryBackend,
   MemoryEntry,
@@ -28,6 +30,7 @@ import {
 } from './types.js';
 import { HNSWIndex } from './hnsw-index.js';
 import { CacheManager } from './cache-manager.js';
+import { encodeMemoryKey } from './memory-key.js';
 
 /**
  * Configuration for AgentDB Adapter
@@ -98,7 +101,7 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
   private index: HNSWIndex;
   private cache: CacheManager<MemoryEntry>;
   private namespaceIndex: Map<string, Set<string>> = new Map();
-  private keyIndex: Map<string, string> = new Map(); // namespace:key -> id
+  private keyIndex: Map<string, string> = new Map(); // encoded [namespace, key] -> id
   private tagIndex: Map<string, Set<string>> = new Map();
   private initialized: boolean = false;
 
@@ -180,18 +183,50 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
       entry.embedding = await this.config.embeddingGenerator(entry.content);
     }
 
+    // Namespace is resolved once, up front, so the dedup lookup below and the
+    // index updates further down agree on the same value.
+    const namespace = entry.namespace || this.config.defaultNamespace;
+    const keyIndexKey = encodeMemoryKey(namespace, entry.key);
+
+    // Idempotent upsert-by-key (Dream Cycle 2026-09-18, hardened post-review):
+    // entry.id is always a fresh random id (generateMemoryId()), so a second
+    // store() under the same (namespace, key) previously left the prior
+    // occupant as an orphan — unreachable via getByKey()/keyIndex, but still
+    // live in entries/namespaceIndex/tagIndex and, for embedded entries,
+    // still a point in the HNSW index, so search()/semanticSearch() returned
+    // stale duplicates forever.
+    const existingId = this.keyIndex.get(keyIndexKey);
+    const isReplacement = existingId !== undefined && existingId !== entry.id;
+
+    // Fallible precondition first: HNSWIndex.addPoint() can throw (dimension
+    // mismatch, index full). Doing this BEFORE evicting the prior occupant
+    // means a rejected write fails cleanly with the prior value still intact,
+    // instead of deleting it and only then discovering the replacement can't
+    // be indexed (a real data-loss bug an adversarial review caught).
+    if (entry.embedding) {
+      await this.index.addPoint(entry.id, entry.embedding);
+    }
+
+    // Evict the prior (namespace,key) occupant via the shared primitive also
+    // used by bulkInsert() and delete(). keyIndex is intentionally left
+    // alone here — it's overwritten to the new id a few lines down, and
+    // clearing it in evictEntry() first would just be redone work (worse,
+    // if evictEntry() read a since-mutated keyIndex it could delete the
+    // mapping this call is about to set).
+    if (isReplacement) {
+      await this.evictEntry(existingId!, { touchKeyIndex: false });
+    }
+
     // Store in main storage
     this.entries.set(entry.id, entry);
 
     // Update namespace index
-    const namespace = entry.namespace || this.config.defaultNamespace;
     if (!this.namespaceIndex.has(namespace)) {
       this.namespaceIndex.set(namespace, new Set());
     }
     this.namespaceIndex.get(namespace)!.add(entry.id);
 
     // Update key index
-    const keyIndexKey = `${namespace}:${entry.key}`;
     this.keyIndex.set(keyIndexKey, entry.id);
 
     // Update tag index
@@ -200,11 +235,6 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
         this.tagIndex.set(tag, new Set());
       }
       this.tagIndex.get(tag)!.add(entry.id);
-    }
-
-    // Index embedding if available
-    if (entry.embedding) {
-      await this.index.addPoint(entry.id, entry.embedding);
     }
 
     // Update cache
@@ -247,7 +277,7 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
    * Get a memory entry by key within a namespace
    */
   async getByKey(namespace: string, key: string): Promise<MemoryEntry | null> {
-    const keyIndexKey = `${namespace}:${key}`;
+    const keyIndexKey = encodeMemoryKey(namespace, key, this.config.defaultNamespace);
     const id = this.keyIndex.get(keyIndexKey);
     if (!id) return null;
     return this.get(id);
@@ -318,6 +348,19 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
    * Delete a memory entry
    */
   async delete(id: string): Promise<boolean> {
+    return this.evictEntry(id, { touchKeyIndex: true });
+  }
+
+  /**
+   * Shared eviction primitive behind delete() and the same-key upsert paths
+   * in store()/bulkInsert() (Dream Cycle 2026-09-18, post-review). Removes
+   * an entry from entries/namespaceIndex/tagIndex/HNSW/cache. touchKeyIndex
+   * is false when the caller is itself about to overwrite the
+   * (namespace,key) -> id mapping to point at a replacement entry —
+   * clearing it here first would either be redone work or, if the mapping
+   * had already been repointed, would incorrectly delete the new mapping.
+   */
+  private async evictEntry(id: string, { touchKeyIndex }: { touchKeyIndex: boolean }): Promise<boolean> {
     const entry = this.entries.get(id);
     if (!entry) return false;
 
@@ -328,8 +371,10 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
     this.namespaceIndex.get(entry.namespace)?.delete(id);
 
     // Remove from key index
-    const keyIndexKey = `${entry.namespace}:${entry.key}`;
-    this.keyIndex.delete(keyIndexKey);
+    if (touchKeyIndex) {
+      const keyIndexKey = encodeMemoryKey(entry.namespace, entry.key, this.config.defaultNamespace);
+      if (this.keyIndex.get(keyIndexKey) === id) this.keyIndex.delete(keyIndexKey);
+    }
 
     // Remove from tag index
     for (const tag of entry.tags) {
@@ -456,6 +501,35 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
       }
     }
 
+    // Same-key upsert (Dream Cycle 2026-09-18, post-review): bulkInsert()
+    // bypassed store()'s per-key dedup entirely, so a batch containing
+    // duplicate (namespace,key) values -- or replacing an already-stored
+    // key -- left old ids reachable via query()/search() while only
+    // keyIndex pointed at the newest one. Computed from the pre-mutation
+    // keyIndex snapshot and input order, before any Map below is touched:
+    // the *last* entry per key in this batch wins (matching what N
+    // sequential store() calls for the same inputs would produce), and any
+    // id that isn't the winner for its key -- a pre-existing occupant or an
+    // earlier same-key entry within this very batch -- is scheduled for
+    // eviction once the winners are safely indexed.
+    const keyOf = (e: MemoryEntry) => encodeMemoryKey(e.namespace, e.key, this.config.defaultNamespace);
+    const winnerIdForKey = new Map<string, string>();
+    for (const entry of entries) {
+      winnerIdForKey.set(keyOf(entry), entry.id);
+    }
+    const idsToEvict = new Set<string>();
+    for (const [key, winnerId] of winnerIdForKey) {
+      const existingId = this.keyIndex.get(key);
+      if (existingId && existingId !== winnerId) {
+        idsToEvict.add(existingId);
+      }
+    }
+    for (const entry of entries) {
+      if (entry.id !== winnerIdForKey.get(keyOf(entry))) {
+        idsToEvict.add(entry.id);
+      }
+    }
+
     // Phase 2: Store all entries (skip individual cache updates)
     const embeddings: Array<{ id: string; embedding: Float32Array }> = [];
 
@@ -470,9 +544,8 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
       }
       this.namespaceIndex.get(namespace)!.add(entry.id);
 
-      // Update key index
-      const keyIndexKey = `${namespace}:${entry.key}`;
-      this.keyIndex.set(keyIndexKey, entry.id);
+      // Update key index (last entry per key wins, per winnerIdForKey above)
+      this.keyIndex.set(keyOf(entry), entry.id);
 
       // Update tag index
       for (const tag of entry.tags) {
@@ -488,16 +561,30 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
       }
     }
 
-    // Phase 3: Batch index embeddings
+    // Phase 3: Batch index embeddings. Deliberately BEFORE Phase 3.5's
+    // eviction below, mirroring store()'s ordering: if addPoint() throws
+    // (dimension mismatch, index full) for any winner, nothing superseded
+    // has been evicted yet, so a failed bulkInsert() doesn't lose data that
+    // a failed single store() wouldn't have lost either.
     for (let i = 0; i < embeddings.length; i += batchSize) {
       const batch = embeddings.slice(i, i + batchSize);
       await Promise.all(batch.map(({ id, embedding }) => this.index.addPoint(id, embedding)));
     }
 
-    // Phase 4: Batch cache update (only populate hot entries)
+    // Phase 3.5: evict superseded occupants (pre-existing and intra-batch),
+    // now that every winner is fully written and indexed. keyIndex is left
+    // alone -- Phase 2 already points it at the correct winner for each key.
+    for (const id of idsToEvict) {
+      await this.evictEntry(id, { touchKeyIndex: false });
+    }
+
+    // Phase 4: Batch cache update (only populate hot entries, winners only —
+    // an evicted loser must not be left warm in the cache under its own id)
     if (this.config.cacheEnabled && entries.length <= this.config.cacheSize) {
       for (const entry of entries) {
-        this.cache.set(entry.id, entry);
+        if (!idsToEvict.has(entry.id)) {
+          this.cache.set(entry.id, entry);
+        }
       }
     }
 
@@ -537,8 +624,8 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
         this.namespaceIndex.get(entry.namespace)?.delete(id);
 
         // Remove from key index
-        const keyIndexKey = `${entry.namespace}:${entry.key}`;
-        this.keyIndex.delete(keyIndexKey);
+        const keyIndexKey = encodeMemoryKey(entry.namespace, entry.key, this.config.defaultNamespace);
+        if (this.keyIndex.get(keyIndexKey) === id) this.keyIndex.delete(keyIndexKey);
 
         // Remove from tag index
         for (const tag of entry.tags) {
@@ -742,7 +829,13 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
   }
 
   /**
-   * Semantic search by content string
+   * Semantic search by content string.
+   *
+   * ADR-125 Phase 5 — degrades gracefully when the embedding generator is
+   * unavailable. Instead of throwing, emits `health:embedder` with
+   * `status: 'degraded'` and falls back to {@link searchKeyword} so the
+   * memory subsystem remains usable when `@claude-flow/embeddings` is
+   * unreachable (per ADR-124's lazy/degrade posture).
    */
   async semanticSearch(
     content: string,
@@ -750,11 +843,60 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
     threshold?: number
   ): Promise<SearchResult[]> {
     if (!this.config.embeddingGenerator) {
-      throw new Error('Embedding generator not configured');
+      this.emit('health:embedder', { status: 'degraded', reason: 'no-generator' });
+      return this.searchKeyword(content, { k, threshold } as SearchOptions);
     }
 
-    const embedding = await this.config.embeddingGenerator(content);
-    return this.search(embedding, { k, threshold });
+    try {
+      const embedding = await this.config.embeddingGenerator(content);
+      return this.search(embedding, { k, threshold });
+    } catch (err) {
+      this.emit('health:embedder', {
+        status: 'degraded',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return this.searchKeyword(content, { k, threshold } as SearchOptions);
+    }
+  }
+
+  /**
+   * Keyword search — in-memory token-overlap ranking against the
+   * `entries` map. Used as a fallback when the embedder is unavailable
+   * and as the "sparse" arm of the hybridSearch controller.
+   *
+   * Falls back to the SqlJs / SQLite backend FTS5 path when a backend is
+   * wired that exposes a `searchKeyword` method. The AgentDBAdapter itself
+   * keeps the implementation cheap and dependency-free.
+   *
+   * @internal ADR-125 Phase 5
+   */
+  async searchKeyword(
+    query: string,
+    options: SearchOptions = { k: 10 } as SearchOptions
+  ): Promise<SearchResult[]> {
+    const k = options.k ?? 10;
+    const tokens = tokenize(query);
+    if (tokens.size === 0) return [];
+
+    const scored: SearchResult[] = [];
+    for (const entry of this.entries.values()) {
+      const entryTokens = tokenize(entry.content);
+      let overlap = 0;
+      for (const t of tokens) if (entryTokens.has(t)) overlap += 1;
+      if (overlap === 0) continue;
+      // Simple token-overlap ratio in [0,1]. Adequate for fallback ranking.
+      const score = overlap / Math.max(tokens.size, 1);
+      if (options.threshold && score < options.threshold) continue;
+      // Apply additional filters if provided
+      if (options.filters) {
+        const filtered = this.applyFilters([entry], options.filters);
+        if (filtered.length === 0) continue;
+      }
+      scored.push({ entry, score, distance: 1 - score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, k);
   }
 
   // ===== Private Methods =====
@@ -764,10 +906,10 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
     const prefix = query.keyPrefix || '';
     const namespace = query.namespace || this.config.defaultNamespace;
 
-    for (const [key, id] of this.keyIndex) {
-      if (key.startsWith(`${namespace}:${prefix}`)) {
-        const entry = this.entries.get(id);
-        if (entry) results.push(entry);
+    for (const id of this.keyIndex.values()) {
+      const entry = this.entries.get(id);
+      if (entry && (entry.namespace || this.config.defaultNamespace) === namespace && entry.key.startsWith(prefix)) {
+        results.push(entry);
       }
     }
 
@@ -1022,16 +1164,239 @@ export class AgentDBAdapter extends EventEmitter implements IMemoryBackend {
     return { status: 'healthy', latency: 0 };
   }
 
-  private async loadFromDisk(): Promise<void> {
-    // Placeholder for persistence implementation
-    // Would use SQLite or file-based storage
-    this.emit('persistence:loaded');
+  /**
+   * Path to the HNSW snapshot sidecar.
+   * Convention: `<persistencePath>.hnsw`
+   */
+  private getHnswSidecarPath(): string | null {
+    if (!this.config.persistencePath) return null;
+    return `${this.config.persistencePath}.hnsw`;
   }
 
-  private async saveToDisk(): Promise<void> {
-    // Placeholder for persistence implementation
-    this.emit('persistence:saved');
+  /**
+   * Path to the in-memory Maps (entries/namespaceIndex/keyIndex/tagIndex) sidecar.
+   * Convention: `<persistencePath>.meta.json`
+   */
+  private getMetaSidecarPath(): string | null {
+    if (!this.config.persistencePath) return null;
+    return `${this.config.persistencePath}.meta.json`;
   }
+
+  /**
+   * Persist a snapshot of the in-memory state to disk.
+   *
+   * Writes two sidecar files alongside `persistencePath`:
+   * - `<persistencePath>.hnsw`        — binary HNSW snapshot via {@link HNSWIndex.serialize}
+   * - `<persistencePath>.meta.json`   — entries + indices in stable JSON
+   *
+   * Public so {@link MemoryService} can trigger periodic snapshots (ADR-125 Phase 3).
+   */
+  async saveSnapshot(): Promise<void> {
+    await this.saveToDisk();
+  }
+
+  /**
+   * ADR-125 Phase 3 — real persistence implementation.
+   *
+   * Loads two sidecar files alongside `persistencePath` (when both exist):
+   * - `<persistencePath>.hnsw`        — binary HNSW snapshot
+   * - `<persistencePath>.meta.json`   — entries + namespaceIndex + keyIndex + tagIndex
+   *
+   * Emits `persistence:loaded` with `{ status: 'restored' | 'fresh' | 'corrupt' }`.
+   * Falls back to a fresh state on any deserialize / IO error so callers don't throw.
+   */
+  private async loadFromDisk(): Promise<void> {
+    const hnswPath = this.getHnswSidecarPath();
+    const metaPath = this.getMetaSidecarPath();
+
+    if (!hnswPath || !metaPath) {
+      this.emit('persistence:loaded', { status: 'fresh', reason: 'no-path' });
+      return;
+    }
+
+    let hnswExists = false;
+    let metaExists = false;
+    try { hnswExists = fs.existsSync(hnswPath); } catch { /* ignore */ }
+    try { metaExists = fs.existsSync(metaPath); } catch { /* ignore */ }
+
+    if (!hnswExists || !metaExists) {
+      this.emit('persistence:loaded', { status: 'fresh', reason: 'no-sidecar' });
+      return;
+    }
+
+    try {
+      const metaRaw = fs.readFileSync(metaPath, 'utf-8');
+      const meta = JSON.parse(metaRaw) as PersistedMeta;
+
+      // Restore entries (rehydrate Float32Array embeddings if present)
+      this.entries.clear();
+      this.namespaceIndex.clear();
+      this.keyIndex.clear();
+      this.tagIndex.clear();
+
+      for (const persisted of meta.entries) {
+        const entry: MemoryEntry = {
+          ...persisted,
+          embedding: persisted.embedding
+            ? Float32Array.from(persisted.embedding)
+            : undefined,
+        };
+        this.entries.set(entry.id, entry);
+        // Rebuild from full tuple fields: legacy v1 keys used ambiguous
+        // namespace:key strings and could omit a colliding tuple entirely.
+        this.keyIndex.set(encodeMemoryKey(entry.namespace, entry.key, this.config.defaultNamespace), entry.id);
+      }
+      for (const [ns, ids] of Object.entries(meta.namespaceIndex)) {
+        this.namespaceIndex.set(ns, new Set(ids));
+      }
+      // Preserve the saved winner for true same-tuple duplicates. Entries
+      // are sorted by random ID on disk, not by their original write order.
+      // Reading IDs also accepts both v1 and v2 key encodings.
+      for (const id of Object.values(meta.keyIndex)) {
+        const entry = this.entries.get(id);
+        if (entry) {
+          this.keyIndex.set(encodeMemoryKey(entry.namespace, entry.key, this.config.defaultNamespace), id);
+        }
+      }
+      for (const [tag, ids] of Object.entries(meta.tagIndex)) {
+        this.tagIndex.set(tag, new Set(ids));
+      }
+
+      // Restore HNSW
+      const hnswBuf = fs.readFileSync(hnswPath);
+      const restored = HNSWIndex.deserialize(hnswBuf);
+      // Swap pointers — preserves forwarded events because we only re-listen
+      // when the adapter is reconstructed (which happens on a fresh instance).
+      this.index = restored;
+      // Re-forward HNSW events
+      this.index.on('point:added', (data) => this.emit('index:added', data));
+
+      this.emit('persistence:loaded', { status: 'restored', count: this.entries.size });
+    } catch (err) {
+      // Corrupt sidecar — start fresh, leave existing files in place for
+      // operator inspection.
+      this.entries.clear();
+      this.namespaceIndex.clear();
+      this.keyIndex.clear();
+      this.tagIndex.clear();
+      this.emit('persistence:loaded', {
+        status: 'corrupt',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * ADR-125 Phase 3 — real snapshot implementation.
+   *
+   * Writes both sidecars atomically via a temp-file-and-rename dance so a
+   * crash mid-write doesn't leave half-baked state on disk.
+   */
+  private async saveToDisk(): Promise<void> {
+    const hnswPath = this.getHnswSidecarPath();
+    const metaPath = this.getMetaSidecarPath();
+
+    if (!hnswPath || !metaPath) {
+      this.emit('persistence:saved', { status: 'skipped', reason: 'no-path' });
+      return;
+    }
+
+    try {
+      // Ensure parent dir exists
+      const dir = path.dirname(hnswPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      // Build stable JSON representation
+      const meta = this.buildPersistedMeta();
+      const metaText = JSON.stringify(meta);
+
+      // Build HNSW snapshot
+      const hnswBuf = this.index.serialize();
+
+      // Atomic write via temp + rename
+      const hnswTmp = `${hnswPath}.tmp`;
+      const metaTmp = `${metaPath}.tmp`;
+      fs.writeFileSync(hnswTmp, hnswBuf);
+      fs.writeFileSync(metaTmp, metaText);
+      fs.renameSync(hnswTmp, hnswPath);
+      fs.renameSync(metaTmp, metaPath);
+
+      this.emit('persistence:saved', {
+        status: 'ok',
+        bytes: hnswBuf.length + Buffer.byteLength(metaText, 'utf-8'),
+      });
+    } catch (err) {
+      this.emit('persistence:saved', {
+        status: 'failed',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Build a stable, diff-friendly JSON representation of the in-memory Maps.
+   * Keys are sorted; embeddings are serialized as plain number arrays.
+   */
+  private buildPersistedMeta(): PersistedMeta {
+    const entriesArr = [...this.entries.values()].sort((a, b) =>
+      a.id.localeCompare(b.id)
+    );
+    const persistedEntries = entriesArr.map((e) => ({
+      ...e,
+      embedding: e.embedding ? Array.from(e.embedding) : undefined,
+    }));
+
+    const namespaceIndex: Record<string, string[]> = {};
+    for (const ns of [...this.namespaceIndex.keys()].sort()) {
+      namespaceIndex[ns] = [...this.namespaceIndex.get(ns)!].sort();
+    }
+    const keyIndex: Record<string, string> = {};
+    for (const k of [...this.keyIndex.keys()].sort()) {
+      keyIndex[k] = this.keyIndex.get(k)!;
+    }
+    const tagIndex: Record<string, string[]> = {};
+    for (const t of [...this.tagIndex.keys()].sort()) {
+      tagIndex[t] = [...this.tagIndex.get(t)!].sort();
+    }
+
+    return { version: 2, entries: persistedEntries, namespaceIndex, keyIndex, tagIndex };
+  }
+}
+
+/**
+ * Wire-format for the meta sidecar (`<persistencePath>.meta.json`).
+ * `embedding` is stored as a plain number[] to keep the JSON canonical.
+ */
+interface PersistedMeta {
+  version: 1 | 2;
+  entries: Array<Omit<MemoryEntry, 'embedding'> & { embedding?: number[] }>;
+  namespaceIndex: Record<string, string[]>;
+  keyIndex: Record<string, string>;
+  tagIndex: Record<string, string[]>;
+}
+
+// ADR-125 Phase 5 — minimal tokenizer for the in-memory keyword fallback.
+// Mirrors the shape used in `smart-retrieval.ts` but is duplicated here so the
+// adapter has no dependency on the retrieval layer.
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'any', 'can',
+  'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his',
+  'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy',
+  'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use', 'with', 'this',
+  'that', 'have', 'from', 'they', 'will', 'been', 'were', 'what', 'when',
+  'your',
+]);
+
+function tokenize(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 2 && !STOPWORDS.has(t))
+  );
 }
 
 export default AgentDBAdapter;

@@ -10,9 +10,12 @@ import type { Command, CommandContext, CommandResult } from '../types.js';
 import { output } from '../output.js';
 import { select, confirm, input } from '../prompt.js';
 import { callMCPTool, MCPClientError } from '../mcp-client.js';
-import { spawn as childSpawn, execSync } from 'child_process';
+import { spawn as childSpawn } from 'child_process';
 import { mkdir, writeFile } from 'fs/promises';
+import { resolveWorkerMcpConfig, currentRufloServer, workCommand } from './hive-mind-worker.js';
 import { join } from 'path';
+import { resolveClaudeLaunchCommand } from '../runtime/claude-command.js';
+import { getHiveTokenForCli } from '../mcp-tools/hive-mind-tools.js';
 
 // Worker type definitions for prompt generation
 interface HiveWorker {
@@ -231,12 +234,11 @@ async function spawnClaudeCodeInstance(
     output.writeln();
     output.printSuccess(`Hive Mind prompt saved to: ${promptFile}`);
 
-    // Check if claude command exists
-    let claudeAvailable = false;
-    try {
-      execSync('which claude', { stdio: 'ignore' });
-      claudeAvailable = true;
-    } catch {
+    // Resolve a directly spawnable command. On Windows, npm exposes shell
+    // shims that Node cannot launch with shell:false, so the resolver follows
+    // the shim to Claude Code's executable or JavaScript entry point.
+    const claudeLaunch = resolveClaudeLaunchCommand();
+    if (!claudeLaunch) {
       output.writeln();
       output.printWarning('Claude Code CLI not found in PATH');
       output.writeln(output.dim('Install it with: npm install -g @anthropic-ai/claude-code'));
@@ -245,9 +247,30 @@ async function spawnClaudeCodeInstance(
 
     const dryRun = flags.dryRun || flags['dry-run'];
 
-    if (claudeAvailable && !dryRun) {
+    if (claudeLaunch && !dryRun) {
       // Build arguments - flags first, then prompt
       const claudeArgs: string[] = [];
+
+      // #1748 Issue 2 — pass --mcp-config so the spawned worker actually has
+      // mcp__ruflo__* tools registered. The config is always a generated file
+      // that Claude accepts; see resolveWorkerMcpConfig for why a source
+      // config (notably ~/.claude.json) is never passed through as-is.
+      // The parser stores flags camelCased (#2269), so read both forms.
+      const mcpConfigPath = resolveWorkerMcpConfig({
+        explicit: (flags['mcp-config'] ?? flags.mcpConfig) as string | undefined,
+        cwd: process.cwd(),
+        home: process.env.HOME || process.env.USERPROFILE || '',
+        outDir: sessionsDir,
+        swarmId,
+        rufloServer: currentRufloServer(),
+      });
+      // #1780 — Claude Code's `--mcp-config` is variadic; passing it as two
+      // argv tokens (`--mcp-config`, `<path>`) lets a later positional (the
+      // hive-mind prompt) be slurped as a second config file, producing
+      // `ENAMETOOLONG: name too long, open` once the prompt exceeds PATH_MAX.
+      // Use `=`-syntax so the flag stays attached to its single value.
+      claudeArgs.push(`--mcp-config=${mcpConfigPath}`);
+      output.printInfo(`Spawned worker MCP config: ${mcpConfigPath}`);
 
       // Check for non-interactive mode
       const isNonInteractive = flags['non-interactive'] || flags.nonInteractive;
@@ -261,7 +284,17 @@ async function spawnClaudeCodeInstance(
       // HIGH-02: Strict boolean check (=== true) instead of loose truthiness (!== false)
       // to prevent undefined/null from being treated as "skip permissions".
       // Behavior change: only explicit --dangerously-skip-permissions flag triggers skip.
-      const skipPermissions = flags['dangerously-skip-permissions'] === true && !flags['no-auto-permissions'];
+      // #2269: the arg parser normalizes kebab-case to camelCase (parser.ts:350,
+      // normalizeKey) and stores only the normalized key, so reading
+      // flags['dangerously-skip-permissions'] alone is always undefined. Accept
+      // both forms — mirroring the isNonInteractive pattern a few lines above.
+      // The deny clause must ALSO accept the yargs-style negation the parser
+      // produces for `--no-auto-permissions` (stored as `autoPermissions: false`,
+      // NOT `noAutoPermissions: true`); without this third clause, the deny half
+      // never fires and `--no-auto-permissions` is silently ignored.
+      const skipPermissions =
+        (flags['dangerously-skip-permissions'] === true || flags.dangerouslySkipPermissions === true) &&
+        !(flags['no-auto-permissions'] || flags.noAutoPermissions || flags.autoPermissions === false);
       if (skipPermissions) {
         claudeArgs.push('--dangerously-skip-permissions');
         if (!isNonInteractive) {
@@ -277,7 +310,10 @@ async function spawnClaudeCodeInstance(
       output.writeln(output.dim('Press Ctrl+C to pause the session'));
 
       // Spawn claude with properly ordered arguments
-      const claudeProcess = childSpawn('claude', claudeArgs, {
+      const claudeProcess = childSpawn(claudeLaunch.command, [
+        ...claudeLaunch.argsPrefix,
+        ...claudeArgs,
+      ], {
         stdio: 'inherit',
         shell: false,
       });
@@ -327,7 +363,21 @@ async function spawnClaudeCodeInstance(
       output.printInfo('The Queen coordinator will orchestrate all worker agents');
       output.writeln(output.dim(`Prompt file saved at: ${promptFile}`));
 
-      return { success: true, promptFile };
+      // #2297: await child exit before returning. Without this, the CLI
+      // process resolves immediately, finishes, and the still-initializing
+      // `claude` child loses its controlling terminal and is killed mid-launch
+      // — visible as a stray XTVERSION reply leaking onto the next shell
+      // prompt (the terminal queried for capabilities, but the child died
+      // before reading the answer). Awaiting also makes the existing
+      // claudeProcess.on('exit', ...) log lines actually print, and lets the
+      // non-interactive (-p / --non-interactive) path complete only after
+      // Claude Code finishes.
+      const claudeExitCode = await new Promise<number>((resolve) => {
+        claudeProcess.on('exit', (c) => resolve(c ?? 0));
+        claudeProcess.on('error', () => resolve(1));
+      });
+
+      return { success: claudeExitCode === 0, promptFile };
     } else if (dryRun) {
       output.writeln();
       output.printInfo('Dry run - would execute Claude Code with prompt:');
@@ -573,6 +623,11 @@ const spawnCommand: Command = {
       description: 'Run Claude Code in non-interactive mode',
       type: 'boolean',
       default: false
+    },
+    {
+      name: 'mcp-config',
+      description: 'Path to .mcp.json for the spawned worker (auto-detects ./.mcp.json or ~/.claude.json if omitted) — fixes #1748 Issue 2',
+      type: 'string'
     }
   ],
   examples: [
@@ -950,19 +1005,33 @@ const taskCommand: Command = {
     output.printInfo('Submitting task to hive...');
 
     try {
+      // #1791.1 — `hive-mind_task` was never registered in the bundled MCP
+      // server (the `mcp__ruflo__hive-mind_*` surface only exposes init,
+      // spawn, status, broadcast, consensus, memory, shutdown, leave). The
+      // CLI was dispatching to a tool that doesn't exist, producing
+      // `MCP tool not found: hive-mind_task` and aborting.
+      //
+      // Re-route to the existing `task_create` tool. Hive-specific options
+      // (consensus requirement, timeout) are preserved as tags so a future
+      // hive-mind worker / consensus tool can pick them up — the data is
+      // not lost just because the dedicated hive-mind tool isn't there yet.
+      const consensusTag = `consensus:${requireConsensus ? 'required' : 'none'}`;
+      const timeoutTag = `timeout:${timeout}s`;
+
       const result = await callMCPTool<{
         taskId: string;
+        type: string;
         description: string;
+        priority: string;
         status: string;
         assignedTo: string[];
-        priority: string;
-        requiresConsensus: boolean;
-        estimatedTime: string;
-      }>('hive-mind_task', {
+        tags: string[];
+        createdAt: string;
+      }>('task_create', {
+        type: 'hive-mind',
         description,
         priority,
-        requireConsensus,
-        timeout,
+        tags: ['hive-mind', consensusTag, timeoutTag],
       });
 
       if (ctx.flags.format === 'json') {
@@ -976,16 +1045,18 @@ const taskCommand: Command = {
           `Task ID: ${result.taskId}`,
           `Status: ${formatAgentStatus(result.status)}`,
           `Priority: ${formatPriority(priority)}`,
-          `Assigned: ${result.assignedTo.join(', ')}`,
-          `Consensus: ${result.requiresConsensus ? 'Yes' : 'No'}`,
-          `Est. Time: ${result.estimatedTime}`
+          `Assigned: ${result.assignedTo.length > 0 ? result.assignedTo.join(', ') : 'pending dispatch'}`,
+          `Consensus: ${requireConsensus ? 'Yes' : 'No'}`,
+          `Timeout: ${timeout}s`,
+          `Tags: ${result.tags.join(', ')}`
         ].join('\n'),
         'Task Submitted'
       );
 
       output.writeln();
       output.printSuccess('Task submitted to hive');
-      output.writeln(output.dim(`  Track with: claude-flow hive-mind task-status ${result.taskId}`));
+      output.writeln(output.dim(`  Run it with: claude-flow hive-mind work --task ${result.taskId}`));
+      output.writeln(output.dim(`  Track with:  claude-flow task status ${result.taskId}`));
 
       return { success: true, data: result };
     } catch (error) {
@@ -1095,7 +1166,7 @@ const joinCommand: Command = {
       return { success: false, exitCode: 1 };
     }
     try {
-      const result = await callMCPTool<{ success: boolean; agentId: string; totalWorkers: number; error?: string }>('hive-mind_join', { agentId, role: ctx.flags.role });
+      const result = await callMCPTool<{ success: boolean; agentId: string; totalWorkers: number; error?: string }>('hive-mind_join', { agentId, role: ctx.flags.role, hiveToken: getHiveTokenForCli() });
       if (!result.success) { output.printError(result.error || 'Failed'); return { success: false, exitCode: 1 }; }
       output.printSuccess(`Agent ${agentId} joined hive (${result.totalWorkers} workers)`);
       return { success: true, data: result };
@@ -1112,7 +1183,7 @@ const leaveCommand: Command = {
     const agentId = ctx.args[0] || ctx.flags['agent-id'] as string || ctx.flags.agentId as string;
     if (!agentId) { output.printError('Agent ID required.'); return { success: false, exitCode: 1 }; }
     try {
-      const result = await callMCPTool<{ success: boolean; agentId: string; remainingWorkers: number; error?: string }>('hive-mind_leave', { agentId });
+      const result = await callMCPTool<{ success: boolean; agentId: string; remainingWorkers: number; error?: string }>('hive-mind_leave', { agentId, hiveToken: getHiveTokenForCli() });
       if (!result.success) { output.printError(result.error || 'Failed'); return { success: false, exitCode: 1 }; }
       output.printSuccess(`Agent ${agentId} left hive (${result.remainingWorkers} remaining)`);
       return { success: true, data: result };
@@ -1135,7 +1206,7 @@ const consensusCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const action = ctx.flags.action as string || 'list';
     try {
-      const result = await callMCPTool<Record<string, unknown>>('hive-mind_consensus', { action, proposalId: ctx.flags.proposalId, type: ctx.flags.type, value: ctx.flags.value, vote: ctx.flags.vote === 'yes', voterId: ctx.flags.voterId });
+      const result = await callMCPTool<Record<string, unknown>>('hive-mind_consensus', { action, proposalId: ctx.flags.proposalId, type: ctx.flags.type, value: ctx.flags.value, vote: ctx.flags.vote === 'yes', voterId: ctx.flags.voterId, hiveToken: getHiveTokenForCli() });
       if (ctx.flags.format === 'json') { output.printJson(result); return { success: true, data: result }; }
       if (action === 'list') {
         output.writeln(output.bold('\nPending Proposals'));
@@ -1282,7 +1353,7 @@ export const hiveMindCommand: Command = {
   name: 'hive-mind',
   aliases: ['hive'],
   description: 'Queen-led consensus-based multi-agent coordination',
-  subcommands: [initCommand, spawnCommand, statusCommand, taskCommand, joinCommand, leaveCommand, consensusCommand, broadcastCommand, memorySubCommand, optimizeMemoryCommand, shutdownCommand],
+  subcommands: [initCommand, spawnCommand, statusCommand, taskCommand, workCommand, joinCommand, leaveCommand, consensusCommand, broadcastCommand, memorySubCommand, optimizeMemoryCommand, shutdownCommand],
   options: [],
   examples: [
     { command: 'claude-flow hive-mind init -t hierarchical-mesh', description: 'Initialize hive' },
@@ -1302,6 +1373,7 @@ export const hiveMindCommand: Command = {
       `${output.highlight('spawn')}           - Spawn worker agents (use --claude to launch Claude Code)`,
       `${output.highlight('status')}          - Show hive status`,
       `${output.highlight('task')}            - Submit task to hive`,
+      `${output.highlight('work')}            - Run the next pending task on an idle worker`,
       `${output.highlight('join')}            - Join an agent to the hive`,
       `${output.highlight('leave')}           - Remove an agent from the hive`,
       `${output.highlight('consensus')}       - Manage consensus proposals`,
